@@ -28,8 +28,8 @@ test = ["pytest>=8"]
 [project.scripts]
 trajmc-calibrate = "trajmc.calibration:main"
 trajmc-compress = "trajmc.compression:main"
-trajmc-evaluate = "trajmc.evaluate:main"
-trajmc-items = "trajmc.analysis.lmeval_to_items:main"
+trajmc-evaluate = "eval.run:main"
+trajmc-items = "analysis.lmeval_to_items:main"
 
 [tool.setuptools.packages.find]
-include = ["trajmc*"]
+include = ["trajmc*", "analysis*", "eval*", "utils*"]

@@ -2,7 +2,9 @@
 
 Core implementation of trajectory-matched calibration (Traj-MC) for masked
 diffusion language models. The repository contains the current random-`t`
-method for both LLaDA and Dream in one `trajmc` package.
+method for both LLaDA and Dream in one `trajmc` package, with evaluation,
+analysis, scripts, utilities, and external baselines separated at the repository
+root.
 
 No model checkpoints, calibration tensors, datasets, raw evaluation outputs,
 or generated low-rank factors are included.
@@ -91,7 +93,7 @@ The output contains per-layer `A`/`B` factors and a
 Verify that BASE and OURS differ only in calibration identity/runtime fields:
 
 ```bash
-python -m trajmc.analysis.summary_diff \
+python -m analysis.summary_diff \
   --base results/weights/llada/base \
   --ours results/weights/llada/ours
 ```
@@ -120,7 +122,7 @@ To produce paired records and run McNemar's test:
 trajmc-items --backend llada --task piqa --arm base
 trajmc-items --backend llada --task piqa --arm ours
 
-python -m trajmc.analysis.mcnemar \
+python -m analysis.mcnemar \
   --base_items <base-items.jsonl> \
   --ours_items <ours-items.jsonl> \
   --benchmark piqa
@@ -129,16 +131,40 @@ python -m trajmc.analysis.mcnemar \
 ## Repository layout
 
 ```text
-trajmc/
+trajmc/                      # method implementation only
 ├── calibration.py          # shared clean-t0 / random-t construction
 ├── compression.py          # shared covariance + whitening + truncation
-├── common.py               # LLaDA/Dream backend specifications
-├── evaluate.py             # one evaluation launcher for both backends
-├── eval/                   # architecture-specific official lm-eval adapters
-└── analysis/               # paired-item conversion and statistical gates
+└── common.py               # LLaDA/Dream backend specifications
+eval/                       # launcher + architecture-specific lm-eval adapters
+analysis/                   # paired-item conversion and statistical gates
+baselines/                  # vendored external comparison implementations
+utils/                      # standalone legacy/reproducibility helpers
+scripts/                    # local and Slurm entry points
 tests/                      # CPU-only core tests
 ```
+
+The source trees in `baselines/` preserve their upstream licenses and notices;
+nested Git metadata, figures, checkpoints, datasets, caches, and raw results are
+not included. See `baselines/README.md` before running a baseline.
 
 The evaluation adapters retain attribution comments to their upstream LLaDA,
 Sink-Aware, and Dream sources. Model weights and datasets remain governed by
 their respective upstream licenses.
+
+## Convenience scripts
+
+Run both clean-`t0` and random-`t` calibration arms:
+
+```bash
+scripts/calibrate_pair.sh llada
+```
+
+Run the full calibration + compression pair:
+
+```bash
+NSAMPLES=256 RATIO=0.8 scripts/run_random_t.sh llada
+```
+
+The same scripts accept `dream`. Environment variables and Slurm templates are
+documented in `scripts/README.md`; generated artifacts always default to the
+ignored `results/` tree.

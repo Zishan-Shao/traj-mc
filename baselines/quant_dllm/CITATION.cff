@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the Quant-dLLM paper."
+title: "Quant-dLLM"
+type: software
+version: 0.1.0
+license: Apache-2.0
+authors:
+  - family-names: Zhang
+    given-names: Tianao
+  - family-names: Li
+    given-names: Zhiteng
+  - family-names: Yan
+    given-names: Xianglong
+  - family-names: Qin
+    given-names: Haotong
+  - family-names: Guo
+    given-names: Yong
+  - family-names: Zhang
+    given-names: Yulun
+preferred-citation:
+  type: article
+  title: "Quant-dLLM: Post-Training Extreme Low-Bit Quantization for Diffusion Large Language Models"
+  year: 2025
+  url: "https://arxiv.org/abs/2510.03274"
+  authors:
+    - family-names: Zhang
+      given-names: Tianao
+    - family-names: Li
+      given-names: Zhiteng
+    - family-names: Yan
+      given-names: Xianglong
+    - family-names: Qin
+      given-names: Haotong
+    - family-names: Guo
+      given-names: Yong
+    - family-names: Zhang
+      given-names: Yulun

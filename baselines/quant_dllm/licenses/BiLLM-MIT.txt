@@ -1,26 +1,6 @@
-# Third-party notices
-
-Parts of the evaluation adapters are derived from upstream projects:
-
-- `eval/llada_harness.py` and `eval/llada_generate.py` derive
-  from [ML-GSAI/LLaDA](https://github.com/ML-GSAI/LLaDA), licensed under the
-  MIT License. Its original notice is reproduced below.
-- `eval/dream_harness.py` derives from
-  [DreamLM/Dream](https://github.com/DreamLM/Dream), licensed under the Apache
-  License 2.0. The file has been modified to load Traj-MC factors and to remove
-  unrelated experiment paths.
-- `baselines/quant_dllm/` is vendored from
-  [ZTA2785/Quant-dLLM](https://github.com/ZTA2785/Quant-dLLM). Its Apache-2.0
-  license and third-party notices are included inside that directory.
-- `baselines/sink_aware_pruning/` is vendored from
-  [VILA-Lab/Sink-Aware-Pruning](https://github.com/VILA-Lab/Sink-Aware-Pruning).
-  Its MIT license is included inside that directory.
-
-## LLaDA MIT notice
-
 MIT License
 
-Copyright (c) 2025 NieShenRuc
+Copyright (c) 2024 Wei Huang
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

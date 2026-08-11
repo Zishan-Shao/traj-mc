@@ -1,0 +1,21 @@
+Quant-dLLM
+Copyright 2025 Quant-dLLM authors
+
+This distribution includes code derived from or inspired by:
+
+- ARB-LLM, https://github.com/ZHITENGLI/ARB-LLM
+  Copyright its respective authors, licensed under Apache License 2.0.
+- BiLLM, https://github.com/Aaronhuang-778/BiLLM
+  Copyright (c) 2024 Wei Huang, licensed under the MIT License.
+  See licenses/BiLLM-MIT.txt.
+
+The optional evaluation setup can download code from:
+
+- LLaDA, https://github.com/ML-GSAI/LLaDA
+- Dream, https://github.com/HKUNLP/Dream
+- OpenCompass, vendored by the LLaDA evaluation repository
+
+Those repositories are not distributed as part of Quant-dLLM. Loader
+adaptations are provided as patches and remain subject to upstream terms.
+Model weights are not distributed by this repository and remain subject to
+the licenses on their respective Hugging Face model cards.

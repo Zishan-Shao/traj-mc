@@ -7,7 +7,7 @@ import torch.nn as nn
 from trajmc import common
 from trajmc.calibration import apply_noise
 from trajmc.compression import plan_bins, whiten_truncate
-from trajmc.evaluate import build_command
+from eval.run import build_command
 
 
 class LLaDABlock(nn.Module):

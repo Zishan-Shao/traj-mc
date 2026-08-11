@@ -1,0 +1,9 @@
+name: quant-dllm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch
+      - -r requirements.txt

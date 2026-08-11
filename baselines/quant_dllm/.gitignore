@@ -1,0 +1,46 @@
+# Python environments and caches
+.venv/
+venv/
+.conda/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime data and generated artifacts
+cache/
+log/
+logs/
+output/
+eval_logs/
+eval_results/
+.hf_modules/
+data/
+models/
+
+# Optional upstream evaluation repositories (created by setup script)
+/LLaDA/
+/Dream/
+
+# Model and tensor artifacts must be hosted outside Git
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.arrow
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

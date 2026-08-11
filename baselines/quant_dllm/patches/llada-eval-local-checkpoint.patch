@@ -1,0 +1,62 @@
+diff --git a/eval_llada.py b/eval_llada.py
+--- a/eval_llada.py
++++ b/eval_llada.py
+@@ -15,7 +15,8 @@ from lm_eval.api.model import LM
+ from lm_eval.api.registry import register_model
+ from tqdm import tqdm
+
+-from transformers import AutoTokenizer, AutoModel
++from transformers import AutoConfig, AutoTokenizer, AutoModel
++from transformers.dynamic_module_utils import get_class_from_dynamic_module
+ from generate import generate
+
+
+@@ -32,6 +33,7 @@ class LLaDAEvalHarness(LM):
+     def __init__(
+         self,
+         model_path='',
++        model_source='',
+         mask_id=126336,
+         max_length=4096,
+         batch_size=32,
+@@ -75,7 +77,27 @@ class LLaDAEvalHarness(LM):
+         if self.accelerator is not None:
+             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
+
+-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
++        tokenizer_path = model_source or model_path
++        if model_source:
++            config = AutoConfig.from_pretrained(
++                model_source, trust_remote_code=True
++            )
++            model_class = get_class_from_dynamic_module(
++                config.auto_map["AutoModel"], model_source
++            )
++            self.model = model_class.from_pretrained(
++                model_path,
++                config=config,
++                torch_dtype=torch.bfloat16,
++                **model_kwargs,
++            )
++        else:
++            self.model = AutoModel.from_pretrained(
++                model_path,
++                trust_remote_code=True,
++                torch_dtype=torch.bfloat16,
++                **model_kwargs,
++            )
+         self.model.eval()
+
+         self.device = torch.device(device)
+@@ -88,8 +109,10 @@ class LLaDAEvalHarness(LM):
+         else:
+             self.model = self.model.to(device)
+
+         self.mask_id = mask_id
+-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
++        self.tokenizer = AutoTokenizer.from_pretrained(
++            tokenizer_path, trust_remote_code=True
++        )
+
+         self.mc_num = mc_num
+         self.batch_size = int(batch_size)
