@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traj-mc"
+version = "0.1.0"
+description = "Trajectory-matched random-t calibration for masked diffusion language models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+  "datasets>=2.19",
+  "numpy>=1.24",
+  "torch>=2.1",
+  "transformers>=4.49",
+]
+
+[project.optional-dependencies]
+eval = [
+  "accelerate>=0.34",
+  "lm_eval>=0.4.8",
+  "packaging>=23",
+  "tqdm>=4.66",
+]
+test = ["pytest>=8"]
+
+[project.scripts]
+trajmc-calibrate = "trajmc.calibration:main"
+trajmc-compress = "trajmc.compression:main"
+trajmc-evaluate = "trajmc.evaluate:main"
+trajmc-items = "trajmc.analysis.lmeval_to_items:main"
+
+[tool.setuptools.packages.find]
+include = ["trajmc*"]

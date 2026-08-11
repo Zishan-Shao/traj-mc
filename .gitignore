@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors and local environment
+.idea/
+.vscode/
+.env
+
+# Generated Traj-MC artifacts (never commit model/data outputs)
+results/
+weights/
+checkpoints/
+outputs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.jsonl
+*.log
+
+# Dataset/model caches
+.cache/
+huggingface/
