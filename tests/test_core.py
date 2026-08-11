@@ -14,6 +14,7 @@ from trajmc.sampling import (
     llada_rollout_states,
     resolve_scheme,
     rollout_call_indices,
+    rollout_call_indices_for_transfers,
     uniform_grid,
 )
 from eval.run import build_command
@@ -194,6 +195,19 @@ class CoreTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(noised[:, :2], windows[:, :2]))
         self.assertTrue(torch.equal(noised[-1, 2:], torch.full((6,), 99)))
+
+    def test_rollout_mapping_tracks_nonuniform_transfer_schedule(self):
+        transfers = [2] * 128 + [1] * 128
+        calls = rollout_call_indices_for_transfers(uniform_grid(16), transfers)
+        self.assertEqual(
+            calls.tolist(),
+            [232, 208, 184, 160, 136, 120, 108, 96,
+             84, 72, 60, 48, 36, 24, 12, 0],
+        )
+        remaining = 384 - torch.tensor(
+            [0, *torch.tensor(transfers).cumsum(0)[:-1].tolist()]
+        )
+        self.assertTrue(torch.equal(remaining[calls], torch.arange(24, 385, 24)))
 
     def test_llada_rollout_states_contain_model_feedback(self):
         model = TinyRolloutModel()

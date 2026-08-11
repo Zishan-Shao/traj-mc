@@ -233,7 +233,15 @@ def main():
         f"s{args.seed}" if sampling_seed == args.seed
         else f"ws{args.seed}_ms{sampling_seed}"
     )
-    prefix = f"{backend.name}_{label}_{args.corpus}_n{nsamples}_{seed_tag}_{tag}_{ghash}"
+    scheme_tag = ""
+    if scheme in {"grid_t_prefix", "rollout"}:
+        scheme_tag += f"_p{args.prefix_ratio:g}".replace(".", "p")
+    if scheme == "rollout":
+        scheme_tag += f"_steps{args.rollout_steps}"
+    prefix = (
+        f"{backend.name}_{label}{scheme_tag}_{args.corpus}_n{nsamples}_"
+        f"{seed_tag}_{tag}_{ghash}"
+    )
 
     print(f"[calib] backend={backend.name} scheme={scheme} label={label} "
           f"corpus={args.corpus} nsamples={nsamples} "

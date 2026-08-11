@@ -29,8 +29,11 @@ protocol fixed. Change only:
    visible prefix.
 
 The calibration audit fails unless all four artifacts contain byte-identical
-`windows_pre`. For `N == rollout_steps`, the rollout arm covers every native
-pre-forward sampler call exactly once.
+`windows_pre`. LLaDA rollout states are selected by remaining MASK count, not
+raw call index, so a non-uniform per-call transfer schedule still matches the
+requested mask-ratio grid. When transfers are uniform and
+`N == rollout_steps`, the rollout arm covers every native pre-forward sampler
+call exactly once.
 
 ## Covariance protocol
 

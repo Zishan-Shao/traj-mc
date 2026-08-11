@@ -60,6 +60,32 @@ def rollout_call_indices(timesteps: torch.Tensor, steps: int) -> torch.Tensor:
     return torch.floor((1.0 - values) * steps).long().clamp(0, steps - 1)
 
 
+def rollout_call_indices_for_transfers(
+    timesteps: torch.Tensor, transfers: list[int]
+) -> torch.Tensor:
+    """Match target mask ratios to states under a non-uniform transfer schedule.
+
+    A call-index grid is only a mask-ratio grid when every sampler call reveals
+    the same number of tokens.  LLaDA front-loads the remainder when the suffix
+    length is not divisible by ``steps``.  Select the pre-forward state whose
+    remaining MASK count is closest to each requested ``t`` instead.
+    """
+    if not transfers or any(value <= 0 for value in transfers):
+        raise ValueError("transfers must be a non-empty list of positive counts")
+    values = torch.as_tensor(timesteps, dtype=torch.float64)
+    if bool(((values <= 0) | (values > 1)).any()):
+        raise ValueError("rollout timesteps must lie in (0, 1]")
+
+    suffix_length = sum(transfers)
+    revealed_before_call = torch.tensor(
+        [0, *torch.tensor(transfers, dtype=torch.long).cumsum(0)[:-1].tolist()],
+        dtype=torch.long,
+    )
+    remaining = suffix_length - revealed_before_call
+    target = values[:, None] * suffix_length
+    return (remaining[None, :].double() - target).abs().argmin(dim=1)
+
+
 def apply_forward_mask(
     windows: torch.Tensor,
     timesteps: torch.Tensor,
@@ -192,7 +218,13 @@ def llada_rollout_states(
     prefix_length = int(prefix_ratio * clean_windows.shape[1])
     suffix_length = clean_windows.shape[1] - prefix_length
     transfers = _transfer_schedule(suffix_length, steps)
-    calls = rollout_call_indices(timesteps, steps)
+    calls = rollout_call_indices_for_transfers(timesteps, transfers)
+    revealed_before_call = torch.tensor(
+        [0, *torch.tensor(transfers).cumsum(0)[:-1].tolist()]
+    )
+    realized_ratios = (
+        (suffix_length - revealed_before_call[calls]).double() / suffix_length
+    )
     device = _model_device(model)
     collected = []
 
@@ -226,6 +258,7 @@ def llada_rollout_states(
     return states, {
         "rollout_call_indices": calls.tolist(),
         "rollout_transfer_schedule": transfers,
+        "rollout_realized_suffix_mask_ratios": realized_ratios.tolist(),
         "sampler": "llada temperature=0 cfg=0 low_confidence single_block",
     }
 
