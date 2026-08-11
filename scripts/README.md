@@ -13,6 +13,6 @@
   partitions, environments, or absolute paths.
 
 Configuration is supplied through environment variables such as `MODEL_PATH`,
-`NSAMPLES`, `SEED`, `RATIO`, `LAYER_TYPE`, `XTX_BUDGET_GB`, and
+`NSAMPLES`, `SEED`, `SAMPLING_SEED`, `RATIO`, `LAYER_TYPE`, `XTX_BUDGET_GB`, and
 `NUM_PROCESSES`, `PREFIX_RATIO`, `ROLLOUT_STEPS`, and `STAGE`. All outputs
 default to the ignored `results/` tree.

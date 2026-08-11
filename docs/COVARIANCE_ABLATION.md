@@ -47,6 +47,10 @@ diagnostic uses exact covariance on a deterministic activation-coordinate
 subspace, making several 8B-model layers practical without claiming that the
 subspace is the full covariance.
 
+Use a fixed `--seed` for clean-window selection and vary only
+`--sampling_seed`; this prevents data-sampling noise from being mistaken for a
+timestep-sampling effect.
+
 An iid-specific covariance advantage requires lower error across repeated
 seeds, not a single favorable checkpoint. If grid wins, the correct conclusion
 is that stratification is a better estimator at that budget. If only rollout

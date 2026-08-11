@@ -173,6 +173,12 @@ def main():
                     help="defaults to the backend's experiment setting")
     ap.add_argument("--seqlen", type=int, default=C.SEQLEN)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--sampling_seed",
+        type=int,
+        default=None,
+        help="timestep/mask/rollout RNG seed; defaults to --seed",
+    )
     ap.add_argument("--model_path", type=str, default=None,
                     help="local checkpoint or Hugging Face id")
     ap.add_argument("--c4_split", type=str, default="train[:100000]")
@@ -208,6 +214,7 @@ def main():
         ap.error(str(exc))
     if not 0.0 <= args.prefix_ratio < 1.0:
         ap.error("--prefix_ratio must lie in [0, 1)")
+    sampling_seed = args.seed if args.sampling_seed is None else args.sampling_seed
     model_path = args.model_path or backend.model_id
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.mask_token_id not in (None, backend.mask_id):
@@ -222,13 +229,16 @@ def main():
 
     ghash = C.git_hash()
     tag = "dry" if args.dry_run else "full"
-    prefix = (
-        f"{backend.name}_{label}_{args.corpus}_n{nsamples}_s{args.seed}_{tag}_{ghash}"
+    seed_tag = (
+        f"s{args.seed}" if sampling_seed == args.seed
+        else f"ws{args.seed}_ms{sampling_seed}"
     )
+    prefix = f"{backend.name}_{label}_{args.corpus}_n{nsamples}_{seed_tag}_{tag}_{ghash}"
 
     print(f"[calib] backend={backend.name} scheme={scheme} label={label} "
           f"corpus={args.corpus} nsamples={nsamples} "
-          f"seqlen={args.seqlen} seed={args.seed}")
+          f"seqlen={args.seqlen} window_seed={args.seed} "
+          f"sampling_seed={sampling_seed}")
 
     traindata, comp, cot = load_corpus(args.corpus, args.c4_split, args.cot_split,
                                       c4_streaming=args.c4_streaming)
@@ -267,7 +277,7 @@ def main():
         prefix_length = 0
     elif scheme == "random_t":
         input_ids, t_list, measured, thirds = apply_noise(
-            windows, args.seed, backend.mask_id
+            windows, sampling_seed, backend.mask_id
         )
         prefix_length = 0
     else:
@@ -282,7 +292,7 @@ def main():
                 windows,
                 timesteps,
                 backend.mask_id,
-                seed=args.seed,
+                seed=sampling_seed,
                 prefix_ratio=prefix_ratio,
             )
         elif scheme == "rollout":
@@ -306,7 +316,7 @@ def main():
                 backend.mask_id,
                 prefix_ratio,
                 args.rollout_steps,
-                args.seed,
+                sampling_seed,
             )
             del model
             if torch.cuda.is_available():
@@ -358,6 +368,8 @@ def main():
         "nsamples": nsamples,
         "seqlen": args.seqlen,
         "seed": args.seed,
+        "window_seed": args.seed,
+        "sampling_seed": sampling_seed,
         "mask_id": backend.mask_id,
         "git_hash": ghash,
         "model_path": model_path,
