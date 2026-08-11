@@ -372,12 +372,15 @@ def main():
     weights_sha256, n_factor_files = fingerprint_weight_dir(args.save_path)
     summary = {
         "arm": arm,
+        "calib_scheme": blob.get("scheme", arm),
         "backend": backend.name,
         "model_id": backend.model_id,
         "calib_file": os.path.basename(args.calib),
         "calib_git_hash": blob.get("git_hash"),
         "calib_sha256": sha256_file(args.calib),
-        "calib_objective": "uniform_activation_reconstruction",
+        "calib_objective": blob.get(
+            "objective", "uniform_activation_reconstruction"
+        ),
         "calibration_batch_size": args.batch_size,
         "ratio": args.ratio,
         "layer_type": args.layer_type,

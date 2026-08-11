@@ -22,6 +22,8 @@ ALLOWED_DIFFER = {
     "arm",
     "calib_file",
     "calib_sha256",
+    "calib_scheme",
+    "calib_objective",
     "peak_rss_gb",
     "run_id",
     "save_path",

@@ -12,11 +12,6 @@ ARM="$2"
 CALIB="$3"
 shift 3
 
-if [[ "${ARM}" != "base" && "${ARM}" != "ours" ]]; then
-  echo "ARM must be base or ours; got ${ARM}" >&2
-  exit 2
-fi
-
 RATIO="${RATIO:-0.8}"
 SAVE_PATH="${SAVE_PATH:-${ROOT_DIR}/results/weights/${BACKEND}/${ARM}}"
 

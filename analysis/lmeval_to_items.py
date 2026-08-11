@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 
 from trajmc import common as C
+from trajmc import sampling as S
 
 
 def _subtask(path: str) -> str:
@@ -58,7 +59,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=sorted(C.BACKENDS), required=True)
     parser.add_argument("--task", required=True)
-    parser.add_argument("--arm", choices=["ref", "base", "ours"], required=True)
+    parser.add_argument(
+        "--arm",
+        choices=sorted({"ref", "base", "ours", *S.SCHEMES}),
+        required=True,
+    )
     parser.add_argument("--lmeval_dir", default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()

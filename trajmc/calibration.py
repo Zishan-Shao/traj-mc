@@ -1,15 +1,9 @@
-"""Build clean-t0 or random-t calibration inputs for either backend.
+"""Build matched calibration inputs for either supported backend.
 
-This is the ONLY module where BASE and OURS differ. The difference is a single
-switch: whether calibration tokens are noised.
-
-  BASE  (--arm base): t=0, no masking. Clean continuous 2048-token windows.
-  OURS  (--arm ours): per window t~U[0,1]; each token masked w.p. t -> MASK_ID.
-                      No prefix protection (continuous windows, no prompt/answer).
-
-Window construction is IDENTICAL and deterministic across arms: the same seed
-produces byte-identical pre-noise windows, so OURS only ever *overwrites* masked
-positions. This is what makes the ③(c) hash/byte-identity check pass.
+The timestep-distribution ablation exposes five schemes over byte-identical
+clean windows: clean t0, iid random-t, deterministic grid-t, grid-t with a
+visible prefix, and true closed-loop reverse-rollout states.  Legacy
+``--arm base|ours`` remains an alias for ``clean_t0|random_t``.
 
 Corpus:
   --corpus c4      : pure C4-en (main experiment).
@@ -27,6 +21,7 @@ import numpy as np
 import torch
 
 from . import common as C
+from . import sampling as S
 
 
 def build_windows(tokenizer, traindata, nsamples, seqlen, seed):
@@ -166,7 +161,13 @@ def load_corpus(corpus, c4_split, cot_split, c4_streaming=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=sorted(C.BACKENDS), required=True)
-    ap.add_argument("--arm", choices=["base", "ours"], required=True)
+    ap.add_argument(
+        "--arm",
+        choices=sorted(S.LEGACY_ARM_SCHEMES),
+        default=None,
+        help="legacy alias: base=clean_t0, ours=random_t",
+    )
+    ap.add_argument("--scheme", choices=S.SCHEMES, default=None)
     ap.add_argument("--corpus", choices=["c4", "c4_cot", "multilingual"], default="c4")
     ap.add_argument("--nsamples", type=int, default=None,
                     help="defaults to the backend's experiment setting")
@@ -180,6 +181,19 @@ def main():
                          "the first qualifying documents are deterministic")
     ap.add_argument("--cot_split", type=str, default="train")
     ap.add_argument("--out_dir", type=str, default=None)
+    ap.add_argument(
+        "--prefix_ratio",
+        type=float,
+        default=0.25,
+        help="visible prefix for grid_t_prefix and rollout",
+    )
+    ap.add_argument(
+        "--rollout_steps",
+        type=int,
+        default=256,
+        help="number of native reverse-sampler model calls",
+    )
+    ap.add_argument("--rollout_device", default="cuda")
     ap.add_argument("--dry_run", action="store_true",
                     help="build a tiny set + rich stats, do NOT save the big tensor")
     ap.add_argument("--dry_n", type=int, default=16)
@@ -188,6 +202,12 @@ def main():
     from transformers import AutoTokenizer
 
     backend = C.get_backend(args.backend)
+    try:
+        scheme, label = S.resolve_scheme(args.arm, args.scheme)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if not 0.0 <= args.prefix_ratio < 1.0:
+        ap.error("--prefix_ratio must lie in [0, 1)")
     model_path = args.model_path or backend.model_id
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.mask_token_id not in (None, backend.mask_id):
@@ -203,10 +223,10 @@ def main():
     ghash = C.git_hash()
     tag = "dry" if args.dry_run else "full"
     prefix = (
-        f"{backend.name}_{args.arm}_{args.corpus}_n{nsamples}_s{args.seed}_{tag}_{ghash}"
+        f"{backend.name}_{label}_{args.corpus}_n{nsamples}_s{args.seed}_{tag}_{ghash}"
     )
 
-    print(f"[calib] backend={backend.name} arm={args.arm} "
+    print(f"[calib] backend={backend.name} scheme={scheme} label={label} "
           f"corpus={args.corpus} nsamples={nsamples} "
           f"seqlen={args.seqlen} seed={args.seed}")
 
@@ -239,25 +259,99 @@ def main():
         hashes = h_c4 + h_cot
         cot_used = n_cot
 
-    # ── the ONLY arm difference: noise ────────────────────────────────────────
-    if args.arm == "base":
+    # ── calibration-state construction; clean windows are identical ──────────
+    rollout_metadata = {}
+    if scheme == "clean_t0":
         input_ids = windows.clone()
         t_list = [0.0] * nsamples
-        measured = [0.0] * nsamples
-        thirds = [[0.0, 0.0, 0.0]] * nsamples
-        n_mask_total = int((input_ids == backend.mask_id).sum())
-    else:
+        prefix_length = 0
+    elif scheme == "random_t":
         input_ids, t_list, measured, thirds = apply_noise(
             windows, args.seed, backend.mask_id
         )
-        n_mask_total = int((input_ids == backend.mask_id).sum())
+        prefix_length = 0
+    else:
+        timesteps = S.uniform_grid(nsamples)
+        t_list = timesteps.tolist()
+        prefix_ratio = args.prefix_ratio if scheme in {
+            "grid_t_prefix", "rollout"
+        } else 0.0
+        prefix_length = int(prefix_ratio * windows.shape[1])
+        if scheme in {"grid_t", "grid_t_prefix"}:
+            input_ids = S.apply_forward_mask(
+                windows,
+                timesteps,
+                backend.mask_id,
+                seed=args.seed,
+                prefix_ratio=prefix_ratio,
+            )
+        elif scheme == "rollout":
+            if not torch.cuda.is_available() and args.rollout_device.startswith("cuda"):
+                ap.error("rollout calibration requested CUDA, but CUDA is unavailable")
+            model, _ = C.load_model(
+                backend,
+                model_path=model_path,
+                dtype=(
+                    torch.bfloat16
+                    if args.rollout_device.startswith("cuda")
+                    else torch.float32
+                ),
+                device=args.rollout_device,
+            )
+            input_ids, rollout_metadata = S.rollout_states(
+                backend.name,
+                model,
+                windows,
+                timesteps,
+                backend.mask_id,
+                prefix_ratio,
+                args.rollout_steps,
+                args.seed,
+            )
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:  # pragma: no cover - argparse/resolve_scheme guard this
+            raise AssertionError(scheme)
+
+    stats = S.mask_statistics(input_ids, backend.mask_id, prefix_length)
+    measured = stats["per_sample_measured_mask_ratio"]
+    thirds = stats["per_sample_mask_thirds"]
+    n_mask_total = stats["total_mask_tokens"]
+    if scheme != "rollout":
+        visible = input_ids.ne(backend.mask_id)
+        if not torch.equal(input_ids[visible], windows[visible]):
+            raise RuntimeError("offline corruption changed a visible clean token")
+    if prefix_length and not torch.equal(
+        input_ids[:, :prefix_length], windows[:, :prefix_length]
+    ):
+        raise RuntimeError("visible-prefix identity invariant failed")
+
+    revealed_suffix = input_ids[:, prefix_length:].ne(backend.mask_id)
+    prediction_mismatches = int(
+        (
+            revealed_suffix
+            & input_ids[:, prefix_length:].ne(windows[:, prefix_length:])
+        ).sum()
+    )
+    revealed_suffix_count = int(revealed_suffix.sum())
+
+    objective = {
+        "clean_t0": "activation_reconstruction_on_clean_t0",
+        "random_t": "iid_uniform_t_forward_corruption",
+        "grid_t": "uniform_grid_t_forward_corruption",
+        "grid_t_prefix": "uniform_grid_t_prefix_preserving_forward_corruption",
+        "rollout": "uniform_exposure_real_reverse_sampler_states",
+    }[scheme]
 
     # ── manifest ──────────────────────────────────────────────────────────────
     manifest = {
-        "arm": args.arm,
+        "arm": label,
+        "scheme": scheme,
+        "objective": objective,
         "backend": backend.name,
         "model_id": backend.model_id,
-        "noise_mode": "clean_t0" if args.arm == "base" else "uniform_t_U01",
+        "noise_mode": scheme,
         "corpus": args.corpus,
         "corpus_composition": comp,
         "cot_windows_used": cot_used,
@@ -270,10 +364,30 @@ def main():
         "window_hashes_prenoise": hashes,
         "per_sample_t": t_list,
         "per_sample_measured_mask_ratio": measured,
+        "per_sample_measured_suffix_mask_ratio": stats[
+            "per_sample_measured_suffix_mask_ratio"
+        ],
         "per_sample_mask_thirds": thirds,
         "total_mask_tokens": n_mask_total,
         "total_tokens": int(input_ids.numel()),
+        "prefix_ratio": prefix_length / windows.shape[1],
+        "prefix_length": prefix_length,
+        "suffix_length": windows.shape[1] - prefix_length,
+        "timestep_design": (
+            "iid_uniform" if scheme == "random_t" else
+            "deterministic_uniform_grid" if scheme in {
+                "grid_t", "grid_t_prefix", "rollout"
+            } else "endpoint_t0"
+        ),
+        "model_prediction_feedback": scheme == "rollout",
+        "revealed_suffix_tokens": revealed_suffix_count,
+        "prediction_mismatches_vs_clean": prediction_mismatches,
+        "prediction_mismatch_fraction": (
+            prediction_mismatches / max(revealed_suffix_count, 1)
+        ),
+        "rollout_steps": args.rollout_steps if scheme == "rollout" else None,
         "dry_run": args.dry_run,
+        **rollout_metadata,
     }
     man_path = str(Path(out_dir) / f"{prefix}_manifest.json")
     C.dump_json(manifest, man_path)
@@ -281,10 +395,15 @@ def main():
 
     if not args.dry_run:
         calib_path = str(Path(out_dir) / f"{prefix}_calib.pt")
-        torch.save({"input_ids": input_ids, "windows_pre": windows,
-                    "window_hashes": hashes, "git_hash": ghash,
-                    "backend": backend.name, "arm": args.arm,
-                    "seed": args.seed}, calib_path)
+        blob = dict(manifest)
+        blob.update(
+            input_ids=input_ids,
+            windows_pre=windows,
+            clean_ids=windows,
+            window_hashes=hashes,
+            attention_mask=torch.ones_like(input_ids),
+        )
+        torch.save(blob, calib_path)
         print(f"[calib] tensor -> {calib_path}  shape={tuple(input_ids.shape)}")
     else:
         # dry summary for ③ checks

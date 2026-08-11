@@ -10,6 +10,7 @@ import sys
 import time
 
 from trajmc import common as C
+from trajmc import sampling as S
 
 
 def build_command(
@@ -108,7 +109,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=sorted(C.BACKENDS), required=True)
     parser.add_argument("--task", required=True)
-    parser.add_argument("--arm", choices=["ref", "base", "ours"], required=True)
+    parser.add_argument(
+        "--arm",
+        choices=sorted({"ref", "base", "ours", *S.SCHEMES}),
+        required=True,
+    )
     parser.add_argument("--weights", default=None)
     parser.add_argument("--model_path", default=None)
     parser.add_argument("--num_processes", type=int, default=1)
