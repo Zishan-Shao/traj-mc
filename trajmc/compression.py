@@ -85,6 +85,16 @@ def whiten_truncate(W, XtX, ratio, decomp="cholesky", solve_dtype=torch.float64,
     whitened SVD in out_dtype (fp32).
     """
     out_dim, in_dim = W.shape
+    if decomp == "identity":
+        # Plain weight SVD: the "no activation statistics" control.  Equivalent
+        # to whitening with XtX = I, but skips the factor and the solve.
+        Wf = W.to(out_dtype)
+        U, S, Vt = torch.linalg.svd(Wf, full_matrices=False)
+        k = min(C.rank_from_ratio(ratio, out_dim, in_dim), S.shape[0])
+        sqrt_s = S[:k].sqrt()
+        A = (U[:, :k] * sqrt_s).contiguous()
+        B = (torch.diag(sqrt_s) @ Vt[:k, :]).contiguous()
+        return A, B, k
     if decomp == "cholesky":
         L = cholesky_factor(XtX, solve_dtype)
     elif decomp == "eigh":
@@ -223,10 +233,14 @@ def fingerprint_weight_dir(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=sorted(C.BACKENDS), required=True)
-    ap.add_argument("--calib", required=True, help="calibration .pt from trajmc-calibrate")
+    ap.add_argument("--calib", default=None,
+                    help="calibration .pt from trajmc-calibrate; "
+                         "not used (and not required) by --decomp identity")
     ap.add_argument("--ratio", type=float, required=True)
     ap.add_argument("--layer_type", choices=["all", "attn", "mlp"], default="all")
-    ap.add_argument("--decomp", choices=["cholesky", "eigh"], default="cholesky")
+    ap.add_argument("--decomp", choices=["cholesky", "eigh", "identity"],
+                    default="cholesky",
+                    help="identity = plain weight SVD, no calibration activations")
     ap.add_argument("--model_path", type=str, default=None,
                     help="local checkpoint or Hugging Face id")
     ap.add_argument("--save_path", required=True)
@@ -250,6 +264,11 @@ def main():
     args = ap.parse_args()
 
     backend = C.get_backend(args.backend)
+    weight_only = args.decomp == "identity"
+    if weight_only and args.calib:
+        ap.error("--decomp identity ignores activations; drop --calib")
+    if not weight_only and not args.calib:
+        ap.error("--calib is required unless --decomp identity")
     model_path = args.model_path or backend.model_id
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ghash = C.git_hash()
@@ -257,21 +276,29 @@ def main():
     t0 = time.time()
 
     # ── load calib (carries the arm identity) ─────────────────────────────────
-    blob = torch.load(args.calib, map_location="cpu")
-    calib_backend = blob.get("backend")
-    if calib_backend and calib_backend != backend.name:
-        raise ValueError(
-            f"calibration backend={calib_backend!r} does not match "
-            f"--backend={backend.name!r}"
-        )
-    input_ids = blob["input_ids"]
-    if args.nsamples and args.nsamples < input_ids.shape[0]:
-        input_ids = input_ids[: args.nsamples]
-    arm = blob.get("arm", "unknown")
-    print(f"[compress] backend={backend.name} arm={arm} "
-          f"calib={os.path.basename(args.calib)} "
-          f"N={input_ids.shape[0]} ratio={args.ratio} layer_type={args.layer_type} "
-          f"decomp={args.decomp}")
+    if weight_only:
+        blob = {}
+        input_ids = None
+        arm = "weight_svd"
+        print(f"[compress] backend={backend.name} arm={arm} calib=<none> "
+              f"ratio={args.ratio} layer_type={args.layer_type} "
+              f"decomp={args.decomp}")
+    else:
+        blob = torch.load(args.calib, map_location="cpu")
+        calib_backend = blob.get("backend")
+        if calib_backend and calib_backend != backend.name:
+            raise ValueError(
+                f"calibration backend={calib_backend!r} does not match "
+                f"--backend={backend.name!r}"
+            )
+        input_ids = blob["input_ids"]
+        if args.nsamples and args.nsamples < input_ids.shape[0]:
+            input_ids = input_ids[: args.nsamples]
+        arm = blob.get("arm", "unknown")
+        print(f"[compress] backend={backend.name} arm={arm} "
+              f"calib={os.path.basename(args.calib)} "
+              f"N={input_ids.shape[0]} ratio={args.ratio} "
+              f"layer_type={args.layer_type} decomp={args.decomp}")
 
     # ── load model ────────────────────────────────────────────────────────────
     model, _tokenizer = C.load_model(backend, model_path, device=device)
@@ -288,36 +315,39 @@ def main():
     # all-linear XtX (~32GB) exceeds a 46GB GPU beside the 16GB model, so targets
     # are split into bins that each fit; one forward pass per bin.
     targets = list(C.iter_target_linears(model, backend, args.layer_type))
-    t_collect = time.time()
-    budget_gb = args.xtx_budget_gb
-    if budget_gb <= 0:
-        if device == "cuda":
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            budget_gb = max(
-                2.0, free_bytes / 1024 ** 3 - args.xtx_headroom_gb
-            )
-            print(
-                f"[compress] automatic XtX budget: "
-                f"free={free_bytes / 1024**3:.1f}GB "
-                f"total={total_bytes / 1024**3:.1f}GB "
-                f"budget={budget_gb:.1f}GB"
-            )
-        else:
-            budget_gb = 8.0
-    bins = plan_bins(targets, budget_gb * 1024 ** 3)
-    print(f"[compress] {len(targets)} target linears -> {len(bins)} XtX pass(es) "
-          f"(budget {budget_gb:.1f}GB/pass)")
     cov = {}
-    for bi, modules in enumerate(bins):
-        gb = sum(m.in_features ** 2 * 4 for m in modules.values()) / 1024 ** 3
-        print(f"[compress] XtX pass {bi+1}/{len(bins)}: "
-              f"{len(modules)} layers, {gb:.1f}GB", flush=True)
-        cov.update(collect_xtx_gpu(
-            model, input_ids, modules, device, log_prefix=f"p{bi+1} ",
-            batch_size=args.batch_size,
-        ))
-    print(f"[compress] XtX collected for {len(cov)} layers "
-          f"({time.time()-t_collect:.0f}s)")
+    if weight_only:
+        print("[compress] --decomp identity: no activation pass")
+    else:
+        t_collect = time.time()
+        budget_gb = args.xtx_budget_gb
+        if budget_gb <= 0:
+            if device == "cuda":
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                budget_gb = max(
+                    2.0, free_bytes / 1024 ** 3 - args.xtx_headroom_gb
+                )
+                print(
+                    f"[compress] automatic XtX budget: "
+                    f"free={free_bytes / 1024**3:.1f}GB "
+                    f"total={total_bytes / 1024**3:.1f}GB "
+                    f"budget={budget_gb:.1f}GB"
+                )
+            else:
+                budget_gb = 8.0
+        bins = plan_bins(targets, budget_gb * 1024 ** 3)
+        print(f"[compress] {len(targets)} target linears -> {len(bins)} XtX pass(es) "
+              f"(budget {budget_gb:.1f}GB/pass)")
+        for bi, modules in enumerate(bins):
+            gb = sum(m.in_features ** 2 * 4 for m in modules.values()) / 1024 ** 3
+            print(f"[compress] XtX pass {bi+1}/{len(bins)}: "
+                  f"{len(modules)} layers, {gb:.1f}GB", flush=True)
+            cov.update(collect_xtx_gpu(
+                model, input_ids, modules, device, log_prefix=f"p{bi+1} ",
+                batch_size=args.batch_size,
+            ))
+        print(f"[compress] XtX collected for {len(cov)} layers "
+              f"({time.time()-t_collect:.0f}s)")
 
     # ── whiten + truncate + replace ───────────────────────────────────────────
     if args.linalg_device == "cuda" and args.offload_model_before_linalg:
@@ -329,11 +359,11 @@ def main():
     orig_params = comp_params = n_comp = n_skip = 0
 
     for name, mod in list(C.iter_target_linears(model, backend, args.layer_type)):
-        if name not in cov:
+        if not weight_only and name not in cov:
             continue
         linalg_device = device if args.linalg_device == "cuda" else "cpu"
         W = mod.weight.data.to(device=linalg_device, dtype=torch.float32)
-        stat = cov[name].to(linalg_device)
+        stat = None if weight_only else cov[name].to(linalg_device)
         out_dim, in_dim = W.shape
         k = C.rank_from_ratio(args.ratio, out_dim, in_dim)
         if not C.is_compression_beneficial(k, out_dim, in_dim):
@@ -375,11 +405,12 @@ def main():
         "calib_scheme": blob.get("scheme", arm),
         "backend": backend.name,
         "model_id": backend.model_id,
-        "calib_file": os.path.basename(args.calib),
+        "calib_file": os.path.basename(args.calib) if args.calib else None,
         "calib_git_hash": blob.get("git_hash"),
-        "calib_sha256": sha256_file(args.calib),
+        "calib_sha256": sha256_file(args.calib) if args.calib else None,
         "calib_objective": blob.get(
-            "objective", "uniform_activation_reconstruction"
+            "objective",
+            "weight_only_svd" if weight_only else "uniform_activation_reconstruction",
         ),
         "calibration_batch_size": args.batch_size,
         "ratio": args.ratio,

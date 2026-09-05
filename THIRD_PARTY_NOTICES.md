@@ -15,6 +15,16 @@ Parts of the evaluation adapters are derived from upstream projects:
 - `baselines/sink_aware_pruning/` is vendored from
   [VILA-Lab/Sink-Aware-Pruning](https://github.com/VILA-Lab/Sink-Aware-Pruning).
   Its MIT license is included inside that directory.
+- `utils/oc_tasks/` reproduces the HumanEval, MBPP, IFEval and BBH protocols
+  from [open-compass/opencompass](https://github.com/open-compass/opencompass),
+  licensed under the Apache License 2.0: the few-shot prompts, the answer
+  extractors, and the BBH chain-of-thought hints in `bbh_prompts/` (originally
+  from [suzgunmirac/BIG-Bench-Hard](https://github.com/suzgunmirac/BIG-Bench-Hard),
+  MIT). `utils/oc_tasks/ifeval/` is vendored verbatim from OpenCompass's
+  `datasets/IFEval/`, which is in turn Google Research's
+  `instruction_following_eval` (Apache-2.0); only its three intra-package
+  imports were rewritten. The Apache-2.0 notice each carries is reproduced
+  below.
 
 ## LLaDA MIT notice
 
@@ -39,3 +49,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Apache License 2.0 notice (OpenCompass, Google Research IFEval)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.

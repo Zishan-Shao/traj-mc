@@ -25,14 +25,19 @@ shared, making the comparison single-variable.
 ### Sampling ablation
 
 The unified calibration command also exposes the four-way distribution
-ablation needed to distinguish iid timestep sampling, MCS-style stratification,
-prefix geometry, and model feedback:
+ablation needed to distinguish iid timestep sampling, stratification, prefix
+geometry, and model feedback:
 
 | Scheme | Timestep design | Visible prefix | State source |
 | --- | --- | ---: | --- |
 | `random_t` | iid `Uniform(0,1)` | 0% | independent clean-token corruption |
 | `grid_t` | exact `1/N,...,1` grid | 0% | independent clean-token corruption |
 | `grid_t_prefix` | exact `1/N,...,1` grid | 25% default | independent clean-token corruption |
+
+`grid_t_prefix` is the released Quant-dLLM MCS: with `prefix_ratio=0.25` it
+reproduces `baselines/quant_dllm/utils/mcs.py::apply_mcs` byte for byte, prefix
+included. `grid_t` is the same grid without the prefix and matches no published
+method; it isolates the timestep axis from the prefix axis.
 | `rollout` | same grid mapped to native sampler calls | 25% default | dense-model reverse trajectory |
 
 The first three never feed predictions back into later states. `rollout`
@@ -56,6 +61,11 @@ stops after calibration because closed-loop collection is GPU-intensive.
 | --- | --- | ---: | ---: |
 | `llada` | `GSAI-ML/LLaDA-8B-Base` | 126336 | 224 (32 × 7) |
 | `dream` | `Dream-org/Dream-v0-Base-7B` | 151666 | 196 (28 × 7) |
+| `llada_instruct` | `GSAI-ML/LLaDA-8B-Instruct` | 126336 | 224 (32 × 7) |
+| `dream_instruct` | `Dream-org/Dream-v0-Instruct-7B` | 151666 | 196 (28 × 7) |
+
+Each Instruct backend reuses its Base sibling's graph, mask token, sampler, and
+lm-eval adapter; only the checkpoint differs.
 
 The embedding and output head always remain dense. A model-graph check aborts
 if the expected backend layout has changed.
@@ -108,6 +118,11 @@ trajmc-compress \
   --ratio 0.8 --layer_type all --decomp cholesky \
   --save_path results/weights/llada/ours
 ```
+
+Passing `--decomp identity` instead runs a plain weight SVD: no activation
+statistics, no calibration file, no forward pass. It is the "no activation"
+control for the low-rank study and is exactly equivalent to whitening with
+`XtX = I`.
 
 `ratio` is the target retained parameter fraction:
 
@@ -166,6 +181,8 @@ trajmc/                      # method implementation only
 └── common.py               # LLaDA/Dream backend specifications
 eval/                       # launcher + architecture-specific lm-eval adapters
 analysis/                   # paired-item conversion and statistical gates
+├── subspace_distance.py    # RQ1: which low-rank subspace each calibration keeps
+└── gen_reconstruction.py   # RQ2: E_gen on held-out real generation states
 baselines/                  # vendored external comparison implementations
 utils/                      # standalone legacy/reproducibility helpers
 scripts/                    # local and Slurm entry points
@@ -197,6 +214,40 @@ NSAMPLES=256 RATIO=0.8 scripts/run_random_t.sh llada
 The same scripts accept `dream`. Environment variables and Slurm templates are
 documented in `scripts/README.md`; generated artifacts always default to the
 ignored `results/` tree.
+
+## Benchmark scope
+
+The evaluation columns split into a protocol-frozen main table (Gen.Recon.,
+GSM8K, MATH-500, MMLU, SVAMP) and a mechanism diagnostic that contrasts
+long-generation protocols (ARC-C, ARC-E) with 3-token option-letter readouts
+(MMLU, HellaSwag, PIQA). Which benchmarks are deliberately *not* run, and why,
+is recorded in `docs/TRAJ_SVD.md` so the decisions are not silently revisited.
+
+## Traj-SVD diagnostics
+
+`docs/TRAJ_SVD.md` describes the low-rank study that asks whether the
+calibration distribution changes *which* subspace is kept, and whether the
+change reduces reconstruction error on real generation states. Two tools
+support it:
+
+```bash
+# RQ1: distance from each calibration's kept rank-k subspace to the real one
+python -m analysis.subspace_distance \
+  --backend llada_instruct --reference rollout --ratio 0.8 \
+  --calib clean=<clean_t0.pt> --calib traj=<grid_t_prefix.pt> \
+  --calib rollout=<rollout.pt> \
+  --out results/stage_a/subspace_distance.json
+
+# RQ2: output reconstruction error on held-out real sampler states
+python -m analysis.gen_reconstruction \
+  --backend llada_instruct --states <heldout-rollout.pt> \
+  --weights clean=<dir> --weights traj=<dir> --weights actual=<dir> \
+  --baseline clean --oracle actual \
+  --out results/stage_a/gen_reconstruction.json
+```
+
+`scripts/run_stage_a.sh` runs both, plus the five matched compression arms they
+compare, from one command.
 
 ## Covariance-estimator diagnostic
 

@@ -116,6 +116,116 @@ def apply_forward_mask(
     return noised
 
 
+def revealed_token_diagnostics(
+    states: torch.Tensor,
+    mask_id: int,
+    prefix_length: int = 0,
+    eos_token_ids: "list[int] | None" = None,
+) -> dict[str, object]:
+    """Concentration of the tokens a rollout actually revealed.
+
+    A reverse rollout is only a usable Actual-State control if the sampler
+    produced real text.  A misconfigured one -- a block far longer than the
+    deployed block length, a prompt outside the checkpoint's input format --
+    fails silently: the model floods the suffix with a single high-confidence
+    token, and every downstream statistic is computed on that.
+
+    ``prediction_mismatch_fraction`` cannot be used for this on its own: "wrote
+    different text" and "wrote nothing" both drive it to ~1.0.  These
+    statistics separate the two.
+    """
+    suffix = states[:, prefix_length:]
+    revealed = suffix.ne(mask_id)
+    values = suffix[revealed]
+    total = int(values.numel())
+    if total == 0:
+        return {
+            "revealed_tokens": 0,
+            "unique_revealed_tokens": 0,
+            "unique_revealed_ratio": None,
+            "top_revealed_token_id": None,
+            "top_revealed_token_share": None,
+            "eos_revealed_share": None,
+            "median_distinct_tokens_per_row": 0,
+        }
+    unique, counts = values.unique(return_counts=True)
+    top = int(counts.argmax())
+    per_row = sorted(
+        int(suffix[row][revealed[row]].unique().numel())
+        for row in range(suffix.shape[0])
+        if bool(revealed[row].any())
+    )
+    eos_share = None
+    if eos_token_ids:
+        eos = torch.tensor(sorted(set(int(i) for i in eos_token_ids)))
+        eos_share = float(torch.isin(values, eos).sum()) / total
+    return {
+        "revealed_tokens": total,
+        "unique_revealed_tokens": int(unique.numel()),
+        "unique_revealed_ratio": int(unique.numel()) / total,
+        "top_revealed_token_id": int(unique[top]),
+        "top_revealed_token_share": float(counts[top]) / total,
+        "eos_revealed_share": eos_share,
+        "median_distinct_tokens_per_row": (
+            per_row[len(per_row) // 2] if per_row else 0
+        ),
+    }
+
+
+def assert_rollout_not_degenerate(
+    diagnostics: dict,
+    max_top_token_share: float = 0.5,
+    max_eos_share: float = 0.5,
+    min_unique_ratio: float = 0.01,
+    min_median_distinct_per_row: int = 8,
+) -> None:
+    """Hard gate: refuse a rollout that flooded one token instead of writing text.
+
+    Reference points measured on this repository's own artifacts.  Genuine C4
+    text: top token 3.85% of revealed positions, unique ratio 0.108, median 350
+    distinct per row.  The collapsed LLaDA-Instruct rollout: top token 99.93%,
+    unique ratio 0.00038, median 1.  Every limit below sits an order of
+    magnitude away from both.
+    """
+    if diagnostics.get("revealed_tokens", 0) == 0:
+        return
+    share = diagnostics.get("top_revealed_token_share")
+    eos_share = diagnostics.get("eos_revealed_share")
+    unique_ratio = diagnostics.get("unique_revealed_ratio")
+    median = diagnostics.get("median_distinct_tokens_per_row", 0)
+    problems = []
+    if share is not None and share > max_top_token_share:
+        problems.append(
+            f"token {diagnostics['top_revealed_token_id']} is {share:.2%} of "
+            f"revealed tokens (limit {max_top_token_share:.0%})"
+        )
+    if eos_share is not None and eos_share > max_eos_share:
+        problems.append(
+            f"EOS/EOT tokens are {eos_share:.2%} of revealed tokens "
+            f"(limit {max_eos_share:.0%})"
+        )
+    if unique_ratio is not None and unique_ratio < min_unique_ratio:
+        problems.append(
+            f"only {diagnostics['unique_revealed_tokens']} distinct tokens over "
+            f"{diagnostics['revealed_tokens']} positions, a ratio of "
+            f"{unique_ratio:.5f} (limit {min_unique_ratio})"
+        )
+    if median < min_median_distinct_per_row:
+        problems.append(
+            f"the median rollout revealed only {median} distinct token(s) "
+            f"(limit {min_median_distinct_per_row})"
+        )
+    if problems:
+        raise RuntimeError(
+            "degenerate rollout: " + "; ".join(problems) + ". The sampler did "
+            "not generate text. Check block_length against the deployed value "
+            "-- LLaDA-8B-Instruct collapses into EOS padding without block "
+            "diffusion -- and whether the prompt matches the checkpoint's "
+            "expected input format. Pass --allow_degenerate_rollout to record "
+            "it anyway."
+        )
+
+
 def mask_statistics(
     states: torch.Tensor, mask_id: int, prefix_length: int = 0
 ) -> dict[str, object]:
@@ -261,6 +371,191 @@ def llada_rollout_states(
         "rollout_realized_suffix_mask_ratios": realized_ratios.tolist(),
         "sampler": "llada temperature=0 cfg=0 low_confidence single_block",
     }
+
+
+def block_transfer_schedule(
+    gen_length: int, block_length: int, steps: int
+) -> tuple[list[int], int, int]:
+    """Flat per-call reveal counts for LLaDA's block-diffusion sampler.
+
+    Mirrors ``eval/llada_generate.generate``: the generation region is split
+    into ``gen_length // block_length`` blocks, each block gets
+    ``steps // num_blocks`` sampler calls, and only the current block is a
+    candidate for revealing.  Returns the concatenated per-call counts along
+    with the block and per-block step counts.
+    """
+    if gen_length <= 0 or block_length <= 0 or steps <= 0:
+        raise ValueError("gen_length, block_length and steps must be positive")
+    if gen_length % block_length:
+        raise ValueError(
+            f"gen_length={gen_length} is not divisible by "
+            f"block_length={block_length}"
+        )
+    num_blocks = gen_length // block_length
+    if steps % num_blocks:
+        raise ValueError(
+            f"steps={steps} is not divisible by num_blocks={num_blocks}"
+        )
+    steps_per_block = steps // num_blocks
+    per_block = _transfer_schedule(block_length, steps_per_block)
+    return per_block * num_blocks, num_blocks, steps_per_block
+
+
+#: LLaDA's EOS / EoT ids, as hard-coded in the official generate.py.
+LLADA_EOS_ID = 126081
+LLADA_EOT_ID = 126348
+
+
+def _select_predictions(
+    logits: torch.Tensor,
+    logits_eos_inf: bool,
+    confidence_eos_eot_inf: bool,
+    eos_id: int = LLADA_EOS_ID,
+    eot_id: int = LLADA_EOT_ID,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predictions and confidences, matching LLaDA's generate.py at temperature 0.
+
+    Order matters and is not obvious.  ``logits_eos_inf`` is applied *before*
+    the argmax, so EOS can never be predicted.  ``confidence_eos_eot_inf`` is
+    applied *after* it, so a position may still predict EOS or EoT but its
+    confidence collapses and it is never chosen by the top-k.  At temperature 0
+    the official ``add_gumbel_noise`` returns its argument unchanged, so the
+    suppression it writes into ``logits_with_noise`` lands on ``logits`` too and
+    reaches the softmax; this reproduces that.
+    """
+    if logits_eos_inf:
+        logits[:, eos_id] = float("-inf")
+    predictions = logits.argmax(dim=-1)
+    if confidence_eos_eot_inf:
+        logits[:, eos_id] = float("-inf")
+        logits[:, eot_id] = float("-inf")
+    chosen = logits.gather(1, predictions.unsqueeze(1)).squeeze(1)
+    confidence = torch.exp(chosen - torch.logsumexp(logits, dim=-1))
+    return predictions, confidence
+
+
+@torch.no_grad()
+def llada_block_rollout_states(
+    model,
+    prompts: torch.Tensor,
+    timesteps: torch.Tensor,
+    mask_id: int,
+    gen_length: int,
+    block_length: int,
+    steps: int,
+    logits_eos_inf: bool = False,
+    confidence_eos_eot_inf: bool = False,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """One true pre-forward state per prompt, under the deployed block sampler.
+
+    ``block_length`` must be the deployed value.  Treating the whole
+    generation region as a single block is what collapses an SFT'd Instruct
+    checkpoint into EOS padding: LLaDA's own evaluation guide introduces block
+    diffusion precisely to suppress that tendency (GSM8K 69.4 -> 78.6 at
+    ``gen_length=256, block_length=8``).
+    """
+    if prompts.ndim != 2:
+        raise ValueError("prompts must have shape [samples, tokens]")
+    if bool(prompts.eq(mask_id).any()):
+        raise ValueError("prompts must not already contain MASK")
+    transfers, num_blocks, steps_per_block = block_transfer_schedule(
+        gen_length, block_length, steps
+    )
+    calls = rollout_call_indices_for_transfers(timesteps, transfers)
+    revealed_before_call = torch.tensor(
+        [0, *torch.tensor(transfers, dtype=torch.long).cumsum(0)[:-1].tolist()]
+    )
+    realized = (gen_length - revealed_before_call[calls]).double() / gen_length
+
+    device = _model_device(model)
+    prompt_length = prompts.shape[1]
+    collected = []
+    projector = _SelectedHeadProjector(model)
+    try:
+        for row, target_call in enumerate(calls.tolist()):
+            state = torch.full(
+                (1, prompt_length + gen_length), mask_id,
+                dtype=torch.long, device=device,
+            )
+            state[:, :prompt_length] = prompts[row : row + 1].to(device)
+            done = False
+            for block in range(num_blocks):
+                block_end = prompt_length + (block + 1) * block_length
+                for step in range(steps_per_block):
+                    if block * steps_per_block + step == target_call:
+                        done = True
+                        break
+                    selection = state.eq(mask_id)
+                    # Only the current block may be revealed.
+                    selection[:, block_end:] = False
+                    positions = torch.nonzero(
+                        selection[0], as_tuple=False
+                    ).squeeze(1)
+                    if positions.numel() == 0:
+                        continue
+                    logits = projector(state, selection)
+                    predictions, confidence = _select_predictions(
+                        logits, logits_eos_inf, confidence_eos_eot_inf
+                    )
+                    take = min(transfers[block * steps_per_block + step],
+                               int(positions.numel()))
+                    if take:
+                        chosen = torch.topk(confidence, k=take).indices
+                        state[0, positions[chosen]] = predictions[chosen]
+                if done:
+                    break
+            collected.append(state[0].cpu().clone())
+    finally:
+        projector.close()
+
+    return torch.stack(collected), {
+        "rollout_call_indices": calls.tolist(),
+        "rollout_transfer_schedule": transfers,
+        "rollout_realized_suffix_mask_ratios": realized.tolist(),
+        "rollout_gen_length": gen_length,
+        "rollout_block_length": block_length,
+        "rollout_num_blocks": num_blocks,
+        "rollout_steps_per_block": steps_per_block,
+        "rollout_logits_eos_inf": logits_eos_inf,
+        "rollout_confidence_eos_eot_inf": confidence_eos_eot_inf,
+        "sampler": (
+            f"llada temperature=0 cfg=0 low_confidence block_diffusion "
+            f"gen_length={gen_length} block_length={block_length} steps={steps} "
+            f"logits_eos_inf={logits_eos_inf} "
+            f"confidence_eos_eot_inf={confidence_eos_eot_inf}"
+        ),
+    }
+
+
+def decode_revealed_samples(
+    states: torch.Tensor,
+    tokenizer,
+    mask_id: int,
+    prefix_length: int,
+    count: int = 5,
+) -> list[dict[str, object]]:
+    """Human-readable slices of what the sampler actually wrote.
+
+    Threshold checks catch the failure modes we already know about; reading a
+    few samples is what catches the ones we do not.
+    """
+    suffix = states[:, prefix_length:]
+    revealed = suffix.ne(mask_id)
+    order = torch.argsort(revealed.sum(dim=1), descending=True)
+    picks = order[:: max(1, len(order) // max(count, 1))][:count]
+    samples = []
+    for row in picks.tolist():
+        tokens = suffix[row][revealed[row]]
+        samples.append({
+            "row": row,
+            "revealed": int(tokens.numel()),
+            "of": int(suffix.shape[1]),
+            "prompt_tail": tokenizer.decode(
+                states[row, max(prefix_length - 24, 0) : prefix_length].tolist()
+            ),
+            "generated": tokenizer.decode(tokens[:96].tolist()),
+        })
+    return samples
 
 
 class _DreamStateCaptured(RuntimeError):

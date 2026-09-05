@@ -30,8 +30,9 @@ def build_command(
     harness_dir = Path(__file__).resolve().parent
     out_path = Path(out_root) / backend.name / arm / "lmeval" / task
     out_path.mkdir(parents=True, exist_ok=True)
+    family = C.arch_family(backend)
 
-    if backend.name == "llada":
+    if family == "llada":
         harness = harness_dir / "llada_harness.py"
         model_name = "llada_dist"
         model_args = [
@@ -71,7 +72,7 @@ def build_command(
 
     if weights:
         model_args.append(f"weights_path={weights}")
-        if backend.name == "dream":
+        if family == "dream":
             model_args.append(f"lowrank_mode={lowrank_mode}")
 
     port = 20000 + (int(os.environ.get("SLURM_JOB_ID", "0")) % 20000)
@@ -87,7 +88,7 @@ def build_command(
         "--model",
         model_name,
         "--tasks",
-        task,
+        str(config.get("lm_eval_task", task)),
         "--num_fewshot",
         str(config["fs"]),
         "--batch_size",
@@ -98,7 +99,7 @@ def build_command(
         str(out_path),
         "--log_samples",
     ]
-    if backend.name == "dream":
+    if family == "dream":
         command.append("--confirm_run_unsafe_code")
     if limit:
         command.extend(["--limit", str(limit)])

@@ -26,10 +26,33 @@ def parse_artifacts(values: list[str]) -> dict[str, str]:
 def audit_blob(label: str, blob: dict, reference: torch.Tensor) -> dict:
     clean = blob["windows_pre"].long()
     states = blob["input_ids"].long()
-    if not torch.equal(clean, reference):
+    # A task-prompt Actual-State rollout is a control, not one of the matched
+    # arms: its obligation is to resemble deployment, not to share a corpus.
+    # Window identity stays binding on every arm that carries a single-variable
+    # claim.
+    matched_arm = not blob.get("prompt_source")
+    if matched_arm and not torch.equal(clean, reference):
         raise AssertionError(f"{label}: clean windows differ from the reference arm")
     if states.shape != clean.shape:
         raise AssertionError(f"{label}: input and clean shapes differ")
+    if not matched_arm:
+        # Timestep grid and prefix invariants below assume the matched-arm
+        # construction; a task rollout carries its own diagnostics instead.
+        masks = states.eq(int(blob["mask_id"]))
+        prefix_length = int(blob.get("prefix_length", 0))
+        return {
+            "scheme": blob.get("scheme", blob.get("arm")),
+            "shape": list(states.shape),
+            "clean_windows_match": False,
+            "matched_arm": False,
+            "prompt_source": blob.get("prompt_source"),
+            "mean_full_mask_ratio": float(masks.float().mean()),
+            "mean_suffix_mask_ratio": float(masks[:, prefix_length:].float().mean()),
+            "prefix_length": prefix_length,
+            "model_prediction_feedback": bool(blob.get("model_prediction_feedback")),
+            "top_revealed_token_share": blob.get("top_revealed_token_share"),
+            "eos_revealed_share": blob.get("eos_revealed_share"),
+        }
 
     scheme = blob.get("scheme", blob.get("arm"))
     mask_id = int(blob["mask_id"])
@@ -54,7 +77,9 @@ def audit_blob(label: str, blob: dict, reference: torch.Tensor) -> dict:
     return {
         "scheme": scheme,
         "shape": list(states.shape),
-        "clean_windows_match": True,
+        "clean_windows_match": bool(matched_arm),
+        "matched_arm": bool(matched_arm),
+        "prompt_source": blob.get("prompt_source"),
         "mean_t": float(timesteps.mean()) if timesteps.numel() else None,
         "mean_full_mask_ratio": float(masks.float().mean()),
         "mean_suffix_mask_ratio": float(
@@ -81,14 +106,20 @@ def main():
         label: torch.load(path, map_location="cpu", weights_only=False)
         for label, path in artifacts.items()
     }
-    first = next(iter(loaded.values()))["windows_pre"].long()
+    matched = [b for b in loaded.values() if not b.get("prompt_source")]
+    if not matched:
+        raise AssertionError("no matched arm to use as the window reference")
+    first = matched[0]["windows_pre"].long()
     rows = {
         label: audit_blob(label, blob, first)
         for label, blob in loaded.items()
     }
     result = {
         "gate": "PASS",
-        "all_clean_windows_byte_identical": True,
+        "all_clean_windows_byte_identical": all(
+            row["clean_windows_match"] for row in rows.values()
+            if row.get("matched_arm", True)
+        ),
         "artifacts": artifacts,
         "schemes": rows,
     }

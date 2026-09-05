@@ -3,7 +3,13 @@
 ## Question
 
 Does iid `t ~ Uniform(0,1)` estimate the diffusion-marginal activation second
-moment better than the deterministic grid used by released Quant-dLLM MCS?
+moment better than the stratified grid of released Quant-dLLM MCS?
+
+Note which scheme is the published baseline: `grid_t_prefix` reproduces
+`baselines/quant_dllm/utils/mcs.py::apply_mcs` byte for byte, prefix included
+(`prefix_ratio=0.25` is that function's default). `grid_t` is the same grid
+with the prefix switched off and corresponds to no published method; it exists
+only to separate the timestep axis from the prefix axis.
 
 For activation vector `h(x_t)`, the target is
 
@@ -23,8 +29,10 @@ Keep backend, clean windows, compression settings, factor rank, and evaluation
 protocol fixed. Change only:
 
 1. `random_t`: iid timestep, full-window Bernoulli corruption;
-2. `grid_t`: deterministic timestep grid, full-window Bernoulli corruption;
-3. `grid_t_prefix`: the same grid with a fixed visible prefix;
+2. `grid_t`: deterministic timestep grid, full-window Bernoulli corruption
+   (axis-isolation arm, not a published method);
+3. `grid_t_prefix`: the same grid with a fixed visible prefix -- this is the
+   released Quant-dLLM MCS;
 4. `rollout`: the same grid mapped to real reverse-sampler calls, with the same
    visible prefix.
 

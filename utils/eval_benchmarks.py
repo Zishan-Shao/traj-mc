@@ -12,7 +12,7 @@ Usage:
   python eval_benchmarks.py --benchmarks all --download_only
 """
 
-import torch, argparse, os, sys, time, json, re, random
+import torch, argparse, os, sys, time, json, re, random, hashlib
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -27,22 +27,62 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_ROOT = os.path.join(REPO_ROOT, 'results')
 
 # ── Benchmark configs (official EVAL.md) ─────────────────────
-ALL_seqlenBENCHMARKS = ['mmlu', 'mmlu_pro', 'hellaswag', 'arc_c', 'gsm8k', 'math', 'gpqa']
+ALL_BENCHMARKS = ['mmlu', 'mmlu_pro', 'hellaswag', 'arc_c', 'arc_e', 'piqa', 'gsm8k', 'math', 'gpqa',
+                  'humaneval', 'mbpp', 'ifeval', 'bbh', 'svamp', 'aime', 'minerva_math']
 
 BENCH_CONFIG = {
     'mmlu':      dict(gen_length=3,   block_length=3,   steps=3,   logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=5),
     'mmlu_pro':  dict(gen_length=256, block_length=256, steps=256, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=5),
+    # HellaSwag and ARC-C are the published LLaDA-8B-Instruct settings, from
+    # the per-benchmark table in the LLaDA repo's evaluation/EVAL.md (and the
+    # matching examples/llada_instruct_gen_{hellaswag_length3_block3,
+    # arcc_length512_block512}.py).  The two differ by 170x in generation
+    # budget and that is deliberate -- do not "harmonise" them.  ARC-E and PIQA
+    # have no published Instruct setting (LLaDA evaluates them only on the Base
+    # model, through lm-eval's likelihood path), so each inherits its nearest
+    # published sibling: ARC-E takes ARC-C's, PIQA takes HellaSwag's.
     'hellaswag': dict(gen_length=3,   block_length=3,   steps=3,   logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=0),
     'arc_c':     dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=0),
+    'arc_e':     dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=0),
+    'piqa':      dict(gen_length=3,   block_length=3,   steps=3,   logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=0),
     'gsm8k':     dict(gen_length=256, block_length=8,   steps=256, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=4),
     'math':      dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=4),
+    'math500':   dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=4),
     'gpqa':      dict(gen_length=64,  block_length=64,  steps=64,  logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=5),
+    # Math columns added alongside GSM8K / MATH-500.  SVAMP takes GSM8K's
+    # protocol verbatim (same fixed 4-shot CoT block, gen 256 / block 8, "The
+    # answer is N"); AIME and Minerva Math take MATH-500's (same 4-shot MATH
+    # block, gen 512 / block 512, boxed answer).  None has an official LLaDA
+    # config, so inheriting the neighbouring column's is the defensible choice.
+    'svamp':        dict(gen_length=256, block_length=8,   steps=256, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=4),
+    'aime':         dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=4),
+    'minerva_math': dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=4),
+    # The four below follow the LLaDA repo's own OpenCompass configs, one per
+    # benchmark (scripts/eval_llada_opencompass.sh -> examples/*.py).  The eos
+    # flags differ per benchmark there and are not interchangeable.
+    #   humaneval  llada_instruct_gen_humaneval_length512_block512_logits.py
+    #   mbpp       llada_instruct_gen_mbpp_length256_block256_confidence.py
+    #   ifeval     llada_instruct_gen_ifeval_length512_block512_confidence.py
+    #   bbh        llada_base_gen_bbh_length256_block256.py  (no Instruct
+    #              config is published; the Base one's settings are used)
+    'humaneval': dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=True,  confidence_eos_eot_inf=False, num_fewshot=0),
+    'mbpp':      dict(gen_length=256, block_length=256, steps=256, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=3),
+    'ifeval':    dict(gen_length=512, block_length=512, steps=512, logits_eos_inf=False, confidence_eos_eot_inf=True,  num_fewshot=0),
+    # BBH's three-shot CoT hints run to 2509 tokens on geometric_shapes, past
+    # the 1900-token default; left-truncating there would eat the chat
+    # template's opening and part of the hint.  LLaDA takes 4096.
+    'bbh':       dict(gen_length=256, block_length=256, steps=256, logits_eos_inf=False, confidence_eos_eot_inf=False, num_fewshot=3,
+                      max_prompt_tokens=3500),
 }
 
-# Target accuracy from LLaDA Table 2 (OpenCompass column), for reference
+# Target accuracy from LLaDA Table 2 (OpenCompass column), for reference.
+# humaneval/mbpp are LLaDA-8B-Instruct's EVAL.md row; bbh is only published for
+# the Base model (47.3) and ifeval only for LLaDA 1.5 (65.2), so neither is a
+# target for this checkpoint and both are left out.
 TABLE2_TARGET = {
     'mmlu': 65.4, 'mmlu_pro': 36.6, 'hellaswag': 75.3,
     'arc_c': 89.2, 'gsm8k': 78.9, 'math': 29.6, 'gpqa': 32.3,
+    'humaneval': 47.0, 'mbpp': 39.6,
 }
 
 # ── args ──────────────────────────────────────────────────────
@@ -56,8 +96,18 @@ parser.add_argument('--llada_path',   type=str, default=REPO_ROOT)
 parser.add_argument('--weights_path', type=str,
                     default=os.path.join(RESULTS_ROOT, 'weights', 'llada', 'ours'))
 parser.add_argument('--benchmarks',   type=str, default='all',
-                    help='Comma-separated: mmlu,mmlu_pro,hellaswag,arc_c,gsm8k,math,gpqa  or "all"')
+                    help='Comma-separated: mmlu,mmlu_pro,hellaswag,arc_c,arc_e,piqa,gsm8k,'
+                         'math,math500,gpqa,humaneval,mbpp,ifeval,bbh,svamp,aime,minerva_math'
+                         '  or "all"')
 parser.add_argument('--limit',        type=int, default=None, help='Max samples per benchmark (None=full)')
+parser.add_argument('--gen_cache',    type=str, default=None,
+                    help='Directory to stream raw generations into, one JSONL per '
+                         'benchmark. A rerun with the same item set picks up where '
+                         'it stopped instead of regenerating (BBH is ~20 h/arm).')
+parser.add_argument('--bbh_per_subtask', type=int, default=None,
+                    help='Cap each of BBH\'s 27 subtasks at its first N questions '
+                         '(None=all 6511). The prefix is deterministic, so every arm '
+                         'sees the same items and a larger cap is a strict superset.')
 parser.add_argument('--batch_size',   type=int, default=4,   help='Inference batch size (default 4)')
 parser.add_argument('--output',       type=str, default=None, help='Output JSON path')
 parser.add_argument('--resume',       action='store_true',
@@ -67,6 +117,31 @@ parser.add_argument('--shuffle_eval', action='store_true',
                     help='Shuffle MMLU test set before applying --limit (avoids subject-ordering bias)')
 parser.add_argument('--sample_seed',  type=int, default=42,
                     help='RNG seed for --shuffle_eval (default 42)')
+# Sampler overrides, for protocol pilots only.  A benchmark's numbers are only
+# comparable to another arm's when both ran the same sampler, so these are not
+# for production columns -- they exist so one protocol can be measured against
+# another on the same items.  The value that actually ran is recorded under
+# 'bench_config' in the output JSON either way.
+parser.add_argument('--gen_length',   type=int, default=None,
+                    help='override the benchmark generation length (pilot use)')
+parser.add_argument('--block_length', type=int, default=None,
+                    help='override the benchmark block length (pilot use)')
+parser.add_argument('--steps',        type=int, default=None,
+                    help='override the benchmark step count (pilot use)')
+# The two eos switches are part of the protocol, not tuning knobs: LLaDA
+# publishes MATH under pure diffusion (block 512, confidence_eos_eot_inf=True)
+# and under block diffusion (block 64, both False), and they are not
+# interchangeable.  0/1 rather than a store_true, so "leave it alone" and "set
+# it to False" stay distinguishable.
+parser.add_argument('--logits_eos_inf', type=int, choices=[0, 1], default=None,
+                    help='override logits_eos_inf (pilot use)')
+parser.add_argument('--confidence_eos_eot_inf', type=int, choices=[0, 1], default=None,
+                    help='override confidence_eos_eot_inf (pilot use)')
+parser.add_argument('--gen_diag',     action='store_true',
+                    help='record EOS/EOT share and distinct-token counts over the '
+                         'raw generated ids, plus the first 10 decoded answers, '
+                         'so a protocol can be checked for the EOS-flooding '
+                         'collapse mode rather than judged on accuracy alone')
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -77,6 +152,25 @@ if args.benchmarks == 'all':
 else:
     BENCHMARKS = [b.strip() for b in args.benchmarks.split(',')]
 
+# eval_math500 reads BENCH_CONFIG['math'] rather than ['math500'] (the two are
+# the same protocol on different test sets), so an override asked for on
+# math500 has to reach 'math' as well or it would silently do nothing.
+_SAMPLER_ALSO = {'math500': ('math',)}
+_overrides = {k: v for k, v in (('gen_length', args.gen_length),
+                                ('block_length', args.block_length),
+                                ('steps', args.steps)) if v is not None}
+_overrides.update({k: bool(v) for k, v in
+                   (('logits_eos_inf', args.logits_eos_inf),
+                    ('confidence_eos_eot_inf', args.confidence_eos_eot_inf))
+                   if v is not None})
+if _overrides:
+    _targets = set(BENCHMARKS)
+    for _b in list(_targets):
+        _targets.update(_SAMPLER_ALSO.get(_b, ()))
+    for _b in sorted(_targets & set(BENCH_CONFIG)):
+        BENCH_CONFIG[_b].update(_overrides)
+        print(f"  [override] {_b}: " + "  ".join(f"{k}={v}" for k, v in _overrides.items()))
+
 # ── download-only mode ────────────────────────────────────────
 if args.download_only:
     print("Pre-caching datasets (run this on a node with internet access)...")
@@ -84,8 +178,6 @@ if args.download_only:
     DATASET_SPECS = [
         ('cais/mmlu',             'all',           ['test', 'dev', 'validation']),
         ('TIGER-Lab/MMLU-Pro',    None,            ['test', 'validation']),
-        ('Rowan/hellaswag',       None,            ['validation']),
-        ('allenai/ai2_arc',       'ARC-Challenge', ['test']),
         ('gsm8k',                 'main',          ['test', 'train']),
     ]
     for path, name, splits in DATASET_SPECS:
@@ -112,6 +204,17 @@ if args.download_only:
                 print(f"  SKIP EleutherAI/hendrycks_math {cat} {split}: {e}")
         if n_ok == len(MATH_CATS):
             print(f"  OK  EleutherAI/hendrycks_math all_cats     {split} ({n_ok}/{len(MATH_CATS)} cats)")
+
+    # HumanEval / MBPP / IFEval / BBH and the multiple-choice columns
+    # (HellaSwag, ARC-C, ARC-E, PIQA) go through oc_tasks.data, which reads the
+    # repos' parquet and jsonl files by name rather than through load_dataset:
+    # on the pinned datasets/huggingface_hub pair here load_dataset raises on
+    # those repos before it touches any data.
+    try:
+        from oc_tasks import data as oc_data
+        oc_data.prefetch()
+    except Exception as e:
+        print(f"  SKIP oc_tasks (humaneval/mbpp/ifeval/bbh): {e}")
 
     # GPQA: gated dataset — requires HF token
     hf_token = None
@@ -550,23 +653,38 @@ if torch.cuda.is_available():
 
 MAX_PROMPT_TOKENS = 1900  # keep under 2048 - gen_length headroom
 
-def _to_chat_text(prompt_text):
-    messages = [{"role": "user", "content": prompt_text}]
+def _to_chat_text(prompt):
+    """Render one prompt as chat text, ready for the generation turn.
+
+    A prompt is either a plain string (one user turn) or a list of
+    ``{'role', 'content'}`` messages -- MBPP's OpenCompass config is a
+    three-shot HUMAN/BOT alternation, which collapsing into a single user turn
+    would not reproduce.  A trailing ``{'role': 'assistant'}`` message is
+    treated as a pre-filled opening for the reply (MBPP's ``[BEGIN]\\n``): it
+    goes after the generation prompt, so the model continues it rather than
+    starting a fresh turn.
+    """
+    messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+    answer_prefix = ''
+    if messages and messages[-1]['role'] == 'assistant':
+        answer_prefix = messages.pop()['content']
     return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False)
+        messages, add_generation_prompt=True, tokenize=False) + answer_prefix
 
 @torch.no_grad()
 def gen_responses(prompt_texts, gen_length, block_length, steps,
-                  logits_eos_inf, confidence_eos_eot_inf):
-    """Batched generation: list of prompt strings → list of decoded responses."""
+                  logits_eos_inf, confidence_eos_eot_inf,
+                  max_prompt_tokens=None):
+    """Batched generation: list of prompts → list of decoded responses."""
     chat_texts = [_to_chat_text(p) for p in prompt_texts]
     enc = tokenizer(chat_texts, return_tensors='pt', add_special_tokens=False, padding=True)
     input_ids  = enc['input_ids'].to(device)
     attn_mask  = enc['attention_mask'].to(device)
 
-    if input_ids.shape[1] > MAX_PROMPT_TOKENS:
-        input_ids = input_ids[:, -MAX_PROMPT_TOKENS:]
-        attn_mask = attn_mask[:, -MAX_PROMPT_TOKENS:]
+    cap = max_prompt_tokens or MAX_PROMPT_TOKENS
+    if input_ids.shape[1] > cap:
+        input_ids = input_ids[:, -cap:]
+        attn_mask = attn_mask[:, -cap:]
 
     out = llada_generate(
         model, input_ids, attn_mask,
@@ -574,13 +692,66 @@ def gen_responses(prompt_texts, gen_length, block_length, steps,
         temperature=0., cfg_scale=0., remasking='low_confidence',
         logits_eos_inf=logits_eos_inf, confidence_eos_eot_inf=confidence_eos_eot_inf,
     )
-    decoded = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
-    return [d.strip() for d in decoded]
+    tail = out[:, input_ids.shape[1]:]
+    decoded = tokenizer.batch_decode(tail, skip_special_tokens=True)
+    decoded = [d.strip() for d in decoded]
+    if args.gen_diag:
+        _record_gen_diag(tail, decoded)
+    return decoded
+
+# Collapse diagnostics for a sampler protocol.  The failure mode this looks for
+# is the one documented in docs/TRAJ_SVD.md: the model writes nothing and the
+# suffix fills with EOS padding, which accuracy alone reports as "hard
+# benchmark" rather than "broken protocol".  EOS is 126081 and EoT 126348, the
+# two ids generate.py itself special-cases.
+EOS_ID, EOT_ID = 126081, 126348
+GEN_DIAG = {'rows': [], 'samples': []}
+
+
+def _record_gen_diag(tail, decoded):
+    """Per-answer EOS/EoT share and distinct-token count over the raw ids."""
+    for row, text in zip(tail, decoded):
+        n = row.numel()
+        pad = int(((row == EOS_ID) | (row == EOT_ID)).sum())
+        GEN_DIAG['rows'].append({
+            'n_tokens': n,
+            'pad_frac': round(pad / n, 4) if n else 0.0,
+            'distinct': int(torch.unique(row).numel()),
+            'chars': len(text),
+        })
+        if len(GEN_DIAG['samples']) < 10:
+            GEN_DIAG['samples'].append(text)
+
+
+def _gen_diag_summary():
+    """Aggregate of GEN_DIAG, or None when --gen_diag was not asked for."""
+    rows = GEN_DIAG['rows']
+    if not rows:
+        return None
+    n = len(rows)
+    mean = lambda k: round(sum(r[k] for r in rows) / n, 4)
+    return {
+        'n_answers': n,
+        'mean_pad_frac': mean('pad_frac'),
+        'mean_distinct': mean('distinct'),
+        'mean_chars': mean('chars'),
+        # The collapse in docs/TRAJ_SVD.md showed as a median of one distinct
+        # token per answer, so the low tail is what matters, not the mean.
+        'frac_answers_over_90pct_pad': round(
+            sum(r['pad_frac'] > 0.9 for r in rows) / n, 4),
+        'frac_answers_under_5_distinct': round(
+            sum(r['distinct'] < 5 for r in rows) / n, 4),
+        'frac_answers_empty': round(sum(r['chars'] == 0 for r in rows) / n, 4),
+        'first_10_answers': GEN_DIAG['samples'],
+    }
+
 
 def gen_response(prompt_text, gen_length, block_length, steps,
-                 logits_eos_inf, confidence_eos_eot_inf):
+                 logits_eos_inf, confidence_eos_eot_inf,
+                 max_prompt_tokens=None):
     return gen_responses([prompt_text], gen_length, block_length, steps,
-                         logits_eos_inf, confidence_eos_eot_inf)[0]
+                         logits_eos_inf, confidence_eos_eot_inf,
+                         max_prompt_tokens)[0]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -591,6 +762,17 @@ def extract_choice(text):
     """Extract first A/B/C/D from generated text."""
     m = re.search(r'\b([A-D])\b', text)
     return m.group(1) if m else None
+
+def _extract_letter(text, n_options):
+    """The option letter OpenCompass would read out of `text`.
+
+    `first_option_postprocess` is what every published multiple-choice column
+    is scored with; at gen_length 512 the model writes a paragraph and a bare
+    `\b[A-D]\b` search picks the wrong letter out of it.  The option range
+    follows the item (PIQA has two), and '' -- no option found -- becomes None.
+    """
+    from oc_tasks.mc_postprocess import first_option_postprocess
+    return first_option_postprocess(text, LETTERS[:n_options]) or None
 
 def extract_choice_abcdj(text):
     """Extract first A-J from generated text (for MMLU-pro with up to 10 options)."""
@@ -658,25 +840,30 @@ def math_match(pred, gold):
 
 LETTERS = 'ABCDEFGHIJ'
 
-def _mmlu_example(row, include_answer=True):
-    choices = row['choices']
-    ans_idx = int(row['answer'])  # 0-3
-    s = f"Question: {row['question'].strip()}\n"
-    for i, c in enumerate(choices):
-        s += f"{LETTERS[i]}. {c}\n"
-    if include_answer:
-        s += f"Answer: {LETTERS[ans_idx]}\n"
-    else:
-        s += "Answer:"
-    return s
-
 def build_mmlu_prompt(row, fewshot_rows):
+    """OpenCompass mmlu_gen_a484b3, the config LLaDA's own example points at.
+
+    A multi-turn chat, not one flattened block: each of the five demonstrations
+    is its own HUMAN/BOT pair, and the hint is repeated in every HUMAN turn.
+    The demonstrations say "Question:/Answer: " while the graded turn says
+    "Q:/A: " -- that asymmetry is in the published config, so it is kept.
+    """
     subject = row['subject'].replace('_', ' ')
-    parts = [f"The following are multiple choice questions (with answers) about {subject}.\n"]
+    hint = (f'There is a single choice question about {subject}. '
+            'Answer the question by replying A, B, C or D.')
+
+    def body(r):
+        opts = '\n'.join(f'{LETTERS[i]}. {c}' for i, c in enumerate(r['choices']))
+        return f"{r['question']}\n{opts}"
+
+    messages = []
     for ex in fewshot_rows:
-        parts.append(_mmlu_example(ex, include_answer=True))
-    parts.append(_mmlu_example(row, include_answer=False))
-    return '\n'.join(parts)
+        messages.append({'role': 'user',
+                         'content': f'{hint}\nQuestion: {body(ex)}\nAnswer: '})
+        messages.append({'role': 'assistant',
+                         'content': f"{LETTERS[int(ex['answer'])]}\n"})
+    messages.append({'role': 'user', 'content': f'{hint}\nQ: {body(row)}\nA: '})
+    return messages
 
 def _mmlu_pro_example(row, include_answer=True):
     opts = row['options']
@@ -697,48 +884,32 @@ def build_mmlu_pro_prompt(row, fewshot_rows):
     parts.append(_mmlu_pro_example(row, include_answer=False))
     return '\n'.join(parts)
 
+def _lettered(options):
+    return '\n'.join(f"{LETTERS[i]}. {opt}" for i, opt in enumerate(options))
+
+
 def build_hellaswag_prompt(row):
-    ctx = row['ctx'].strip()
-    endings = row['endings']
-    s = f"Context: {ctx}\nWhat happens next?\n"
-    for i, e in enumerate(endings):
-        s += f"{LETTERS[i]}. {e.strip()}\n"
-    s += "Answer:"
-    return s
+    """OpenCompass hellaswag_gen_6faab5, the config LLaDA's own example uses."""
+    return (f"{row['context']}\n"
+            "Question: Which ending makes the most sense?\n"
+            f"{_lettered(row['options'])}\n"
+            "You may choose from 'A', 'B', 'C', 'D'.\n"
+            "Answer:")
 
-def _arc_choices(row):
-    """Return list of (letter, text) and the gold letter."""
-    labels = row['choices']['label']
-    texts  = row['choices']['text']
-    letter_map = {}
-    for i, lbl in enumerate(labels):
-        if lbl in 'ABCDE':
-            letter_map[lbl] = texts[i]
-        else:
-            letter_map[LETTERS[i]] = texts[i]
 
-    ans_key = row['answerKey']
-    if ans_key not in LETTERS:
-        # numeric key like "1","2","3","4"
-        idx = int(ans_key) - 1
-        gold = LETTERS[idx]
-        letter_map = {LETTERS[i]: texts[i] for i in range(len(texts))}
-    else:
-        gold = ans_key
-        # remap if labels were numeric
-        if ans_key not in letter_map:
-            letter_map = {LETTERS[i]: texts[i] for i in range(len(texts))}
-            gold = LETTERS[labels.index(ans_key)] if ans_key in labels else LETTERS[int(ans_key)-1]
+def build_arc_prompt(row):
+    """OpenCompass ARC_c_gen_1e0de5, the config LLaDA's own example uses."""
+    return (f"Question: {row['question']}\n"
+            f"{_lettered(row['options'])}\n"
+            "Answer:")
 
-    return letter_map, gold
 
-def build_arc_c_prompt(row):
-    letter_map, gold = _arc_choices(row)
-    s = f"Question: {row['question'].strip()}\n"
-    for ltr in sorted(letter_map):
-        s += f"{ltr}. {letter_map[ltr]}\n"
-    s += "Answer:"
-    return s, gold
+def build_piqa_prompt(row):
+    """No published config; ARC-C's stem/options/Answer shape, PIQA's two solutions."""
+    return (f"Question: {row['goal']}\n"
+            f"{_lettered(row['options'])}\n"
+            "Answer:")
+
 
 # Official 4-shot examples from OpenCompass (gsm8k_gen_1d7fe4.py), fixed across all runs
 _GSM8K_FEWSHOT = [
@@ -852,7 +1023,265 @@ def _run_batched(items, build_fn, extract_fn, cfg, desc, gold_fn):
     return n_correct / n_total if n_total > 0 else 0.0, n_total
 
 
+# ─────────────────────────────────────────────────────────────
+# OpenCompass-protocol benchmarks (HumanEval, MBPP, IFEval, BBH)
+#
+# These four are scored by executing code or by running an instruction judge,
+# not by string equality, so they generate first and score in bulk afterwards
+# rather than going through _run_batched. Prompt construction and scoring live
+# in utils/oc_tasks/, ported from the OpenCompass configs the LLaDA repo
+# points at; everything here is the generation loop around them.
+# ─────────────────────────────────────────────────────────────
+
+# Extra metrics a benchmark reports beside `acc` (IFEval's four cuts, BBH's
+# per-subtask breakdown). Written into the results JSON next to acc/n.
+EXTRA_METRICS = {}
+
+
+def _gen_cache_paths(bench):
+    """Where this run's generations are streamed, if --gen_cache is set."""
+    if not args.gen_cache:
+        return None
+    os.makedirs(args.gen_cache, exist_ok=True)
+    return os.path.join(args.gen_cache, f'{bench}_gens.jsonl')
+
+
+def _item_key(item):
+    """Stable id for one question: its rendered turns, nothing else.
+
+    Keying the cache by content rather than by position means a rerun with a
+    different --limit or a larger --bbh_per_subtask reuses every question it
+    has already answered, even though the item list is ordered differently.
+    """
+    payload = json.dumps([item['messages'], item.get('answer_prefix', '')],
+                         sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _read_gen_cache(path):
+    """Previously generated answers, keyed by question."""
+    cached = {}
+    if not path or not os.path.exists(path):
+        return cached
+    with open(path) as handle:
+        for line in handle:
+            try:                    # a killed job can leave a half-written line
+                record = json.loads(line)
+            except Exception:
+                break
+            cached[record['key']] = record['gen']
+    return cached
+
+
+def _generate_for(items, cfg, desc, cache_path=None):
+    """Greedy generation for a list of oc_tasks items, in order."""
+    cached = _read_gen_cache(cache_path)
+    todo = [(i, item) for i, item in enumerate(items)
+            if _item_key(item) not in cached]
+    if cached:
+        print(f"  {len(items) - len(todo)}/{len(items)} answers already cached")
+    handle = open(cache_path, 'a') if cache_path else None
+    try:
+        _generate_loop(todo, cfg, desc, args.batch_size, cached, handle)
+    finally:
+        if handle:
+            handle.close()
+    return [cached[_item_key(item)] for item in items]
+
+
+def _generate_loop(todo, cfg, desc, bs, cached, handle):
+    """Answer every (index, item) in `todo`, filling `cached` as it goes."""
+    for start in tqdm(range(0, len(todo), bs), desc=desc, leave=False):
+        batch = [item for _, item in todo[start:start + bs]]
+        # An assistant-prefixed reply (MBPP) is carried as a trailing
+        # assistant message, which _to_chat_text appends after the generation
+        # prompt.
+        prompts = [
+            item['messages'] + [{'role': 'assistant', 'content': item['answer_prefix']}]
+            if item.get('answer_prefix') else item['messages']
+            for item in batch
+        ]
+        kw = dict(max_prompt_tokens=cfg.get('max_prompt_tokens'))
+        try:
+            out = gen_responses(prompts, cfg['gen_length'], cfg['block_length'],
+                                cfg['steps'], cfg['logits_eos_inf'],
+                                cfg['confidence_eos_eot_inf'], **kw)
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() and bs > 1:
+                torch.cuda.empty_cache()
+                out = [gen_response(p, cfg['gen_length'], cfg['block_length'],
+                                    cfg['steps'], cfg['logits_eos_inf'],
+                                    cfg['confidence_eos_eot_inf'], **kw)
+                       for p in prompts]
+            else:
+                raise
+        for item, text in zip(batch, out):
+            cached[_item_key(item)] = text
+            if handle:
+                handle.write(json.dumps({'key': _item_key(item), 'gen': text}) + '\n')
+        if handle:
+            handle.flush()
+
+
+def _run_oc_task(bench, module, items, cfg, desc):
+    gens = _generate_for(items, cfg, desc, _gen_cache_paths(bench))
+    result = module.score(items, gens)
+    PER_ITEM[bench] = result.pop('per_item')
+    acc, n = result.pop('acc'), result.pop('n')
+    if result:
+        EXTRA_METRICS[bench] = result
+    return acc, n
+
+
+def _math_fewshot(cfg):
+    """The MATH few-shot block exactly as eval_math / eval_math500 build it."""
+    from datasets import load_dataset, concatenate_datasets
+    MATH_CATS = ['algebra', 'counting_and_probability', 'geometry',
+                 'intermediate_algebra', 'number_theory', 'prealgebra', 'precalculus']
+    train_ds = concatenate_datasets(
+        [load_dataset('EleutherAI/hendrycks_math', c, split='train') for c in MATH_CATS])
+    return list(train_ds.select(range(cfg['num_fewshot'])))
+
+
+def _cached_answer_eval(bench, desc, items, cfg, extract_fn, equiv_fn):
+    """Generate through the resumable cache (--gen_cache), then grade in bulk.
+
+    Same shape as _run_oc_task, for benchmarks graded by answer equivalence
+    rather than by execution: every item carries its rendered `messages`
+    (the cache key), its `gold`, and the source row as `meta`.
+    """
+    gens = _generate_for(items, cfg, desc, _gen_cache_paths(bench))
+    recs = []
+    for i, (item, gen) in enumerate(zip(items, gens)):
+        pred = extract_fn(gen)
+        ok = bool(pred is not None and equiv_fn(pred, item['gold']))
+        recs.append({'idx': i, 'id': item['meta'].get('id'), 'gold': item['gold'],
+                     'pred': None if pred is None else str(pred), 'correct': ok})
+    PER_ITEM[bench] = recs
+    return (sum(r['correct'] for r in recs) / len(recs) if recs else 0.0), len(recs)
+
+
+def _mc_eval(bench, desc, rows, cfg, build_fn):
+    """A zero-shot multiple-choice column: one option letter per question.
+
+    Same resumable path as the generative columns (--gen_cache), so a worker
+    that loses its card mid-column resumes instead of regenerating.  The letter
+    range follows each item's own option count rather than a fixed A-D.
+    """
+    items = [{'messages': [{'role': 'user', 'content': build_fn(row)}],
+              'gold': row['gold'], 'meta': row} for row in rows]
+    gens = _generate_for(items, cfg, desc, _gen_cache_paths(bench))
+    recs = []
+    for i, (item, gen) in enumerate(zip(items, gens)):
+        pred = _extract_letter(gen, len(item['meta']['options']))
+        recs.append({'idx': i, 'id': item['meta']['id'], 'gold': item['gold'],
+                     'pred': pred, 'correct': bool(pred is not None and pred == item['gold'])})
+    PER_ITEM[bench] = recs
+    return (sum(r['correct'] for r in recs) / len(recs) if recs else 0.0), len(recs)
+
+
+def eval_svamp(limit=None):
+    """SVAMP (1000 problems, test split first) on GSM8K's protocol."""
+    from oc_tasks import data as oc_data
+    cfg = BENCH_CONFIG['svamp']
+    rows = oc_data.load_svamp()
+    rows = rows[:limit] if limit else rows
+    items = [{'messages': [{'role': 'user', 'content': build_gsm8k_prompt(row)}],
+              'gold': row['answer'], 'meta': row} for row in rows]
+    print(f"\n  SVAMP: {len(items)} problems, GSM8K 4-shot CoT, numeric match")
+    return _cached_answer_eval('svamp', 'SVAMP', items, cfg, extract_number,
+                               lambda pred, gold: numbers_equal(pred, gold))
+
+
+def eval_aime(limit=None):
+    """AIME 2024 + 2025 (60 problems) on MATH-500's protocol; integer answers."""
+    from oc_tasks import data as oc_data, math_grade
+    cfg = BENCH_CONFIG['aime']
+    fewshot = _math_fewshot(cfg)
+    rows = oc_data.load_aime()
+    rows = rows[:limit] if limit else rows
+    items = [{'messages': [{'role': 'user', 'content': build_math_prompt(row, fewshot)}],
+              'gold': row['answer'], 'meta': row} for row in rows]
+    print(f"\n  AIME: {len(items)} problems (2024 I/II + 2025 I/II), MATH 4-shot, boxed integer")
+    return _cached_answer_eval('aime', 'AIME', items, cfg,
+                               math_grade.extract_answer, math_grade.aime_equiv)
+
+
+def eval_minerva_math(limit=None):
+    """Minerva Math (272 OCW problems) on MATH-500's protocol.
+
+    Graded like Qwen2.5-Math: numeric answers at rel_tol 1e-4, symbolic ones
+    through sympy.  The numeric-answer subset and a looser 5% tolerance are
+    reported beside the headline so the column can be qualified if needed.
+    """
+    from oc_tasks import data as oc_data, math_grade
+    cfg = BENCH_CONFIG['minerva_math']
+    fewshot = _math_fewshot(cfg)
+    rows = oc_data.load_minerva_math()
+    rows = rows[:limit] if limit else rows
+    items = [{'messages': [{'role': 'user', 'content': build_math_prompt(row, fewshot)}],
+              'gold': row['answer'], 'meta': row} for row in rows]
+    print(f"\n  Minerva Math: {len(items)} problems, MATH 4-shot, boxed answer (numeric rel_tol 1e-4 / sympy)")
+    acc, n = _cached_answer_eval('minerva_math', 'Minerva', items, cfg,
+                                 math_grade.extract_answer, math_grade.is_equiv)
+    recs = PER_ITEM['minerva_math']
+    numeric = [math_grade.to_number(r['gold']) is not None for r in recs]
+    loose = [bool(r['pred'] is not None and math_grade.is_equiv(r['pred'], r['gold'], rel_tol=5e-2))
+             for r in recs]
+    for r, is_num in zip(recs, numeric):
+        r['numeric_gold'] = is_num
+    n_num = sum(numeric)
+    EXTRA_METRICS['minerva_math'] = {
+        'acc_numeric_subset': (sum(r['correct'] for r, m in zip(recs, numeric) if m) / n_num) if n_num else 0.0,
+        'n_numeric': n_num,
+        'acc_rel_tol_5pct': (sum(loose) / n) if n else 0.0,
+    }
+    return acc, n
+
+
+def eval_humaneval(limit=None):
+    from oc_tasks import humaneval as task
+    cfg = BENCH_CONFIG['humaneval']
+    items = task.build(limit=limit)
+    print(f"\n  HumanEval: {len(items)} problems, zero-shot, pass@1 by execution")
+    return _run_oc_task('humaneval', task, items, cfg, 'HumanEval')
+
+
+def eval_mbpp(limit=None):
+    from oc_tasks import mbpp as task
+    cfg = BENCH_CONFIG['mbpp']
+    items = task.build(limit=limit)
+    print(f"\n  MBPP: {len(items)} problems (task_id 11-510), 3-shot, pass@1 by execution")
+    return _run_oc_task('mbpp', task, items, cfg, 'MBPP')
+
+
+def eval_ifeval(limit=None):
+    from oc_tasks import ifeval_task as task
+    cfg = BENCH_CONFIG['ifeval']
+    items = task.build(limit=limit)
+    print(f"\n  IFEval: {len(items)} prompts, zero-shot; acc = prompt-level strict")
+    return _run_oc_task('ifeval', task, items, cfg, 'IFEval')
+
+
+def eval_bbh(limit=None):
+    from oc_tasks import bbh as task
+    cfg = BENCH_CONFIG['bbh']
+    items = task.build(limit=limit, per_subtask=args.bbh_per_subtask)
+    cap = args.bbh_per_subtask
+    print(f"\n  BBH: {len(items)} questions over 27 subtasks, 3-shot CoT"
+          + (f" (first {cap} per subtask)" if cap else " (full set)")
+          + "; acc = mean over subtasks")
+    return _run_oc_task('bbh', task, items, cfg, 'BBH')
+
+
 def eval_mmlu(limit=None):
+    """MMLU on the published LLaDA-8B-Instruct protocol (gen 3, 5-shot).
+
+    Headline `acc` is the **unweighted mean of the 57 subject accuracies**,
+    which is what OpenCompass's `mmlu` summary group reports and therefore what
+    LLaDA's published 65.4 is.  The item-pooled number (its `mmlu-weighted`
+    group) and the per-subject breakdown go alongside it in the results json.
+    """
     from datasets import load_dataset
     cfg = BENCH_CONFIG['mmlu']
     print("\n  Loading MMLU dev split for few-shot...")
@@ -861,19 +1290,36 @@ def eval_mmlu(limit=None):
     for row in dev_ds:
         fewshot_by_subject[row['subject']].append(row)
 
-    test_ds = load_dataset('cais/mmlu', 'all', split='test')
-    items = list(test_ds)
+    rows = list(load_dataset('cais/mmlu', 'all', split='test'))
     if args.shuffle_eval:
-        rng_s = random.Random(args.sample_seed)
-        rng_s.shuffle(items)
+        random.Random(args.sample_seed).shuffle(rows)
     if limit:
-        items = items[:min(limit, len(items))]
+        rows = rows[:min(limit, len(rows))]
 
-    def build(row):
-        fewshot = fewshot_by_subject.get(row['subject'], [])[:cfg['num_fewshot']]
-        return build_mmlu_prompt(row, fewshot), LETTERS[int(row['answer'])]
+    # FixKRetriever fix_id_list=[0..4]: the subject's first five dev rows.
+    items = [{'messages': build_mmlu_prompt(
+                  row, fewshot_by_subject.get(row['subject'], [])[:cfg['num_fewshot']]),
+              'gold': LETTERS[int(row['answer'])], 'meta': row} for row in rows]
+    print(f"\n  MMLU: {len(items)} questions, 5-shot, option letter "
+          f"(acc = unweighted mean over subjects)")
+    gens = _generate_for(items, cfg, 'MMLU', _gen_cache_paths('mmlu'))
 
-    return _run_batched(items, build, extract_choice, cfg, 'MMLU', None)
+    recs, by_subject = [], defaultdict(list)
+    for i, (item, gen) in enumerate(zip(items, gens)):
+        pred = _extract_letter(gen, 4)
+        ok = bool(pred is not None and pred == item['gold'])
+        recs.append({'idx': i, 'subject': item['meta']['subject'], 'gold': item['gold'],
+                     'pred': pred, 'correct': ok})
+        by_subject[item['meta']['subject']].append(ok)
+    PER_ITEM['mmlu'] = recs
+    per_subject = {k: sum(v) / len(v) for k, v in sorted(by_subject.items())}
+    EXTRA_METRICS['mmlu'] = {
+        'acc_pooled': (sum(r['correct'] for r in recs) / len(recs)) if recs else 0.0,
+        'per_subject': per_subject,
+        'n_subjects': len(per_subject),
+    }
+    acc = (sum(per_subject.values()) / len(per_subject)) if per_subject else 0.0
+    return acc, len(recs)
 
 
 def eval_mmlu_pro(limit=None):
@@ -899,33 +1345,48 @@ def eval_mmlu_pro(limit=None):
 
 
 def eval_hellaswag(limit=None):
-    from datasets import load_dataset
+    from oc_tasks import data as oc_data
     cfg = BENCH_CONFIG['hellaswag']
-    ds = load_dataset('Rowan/hellaswag', split='validation')
-    if limit:
-        ds = ds.select(range(min(limit, len(ds))))
-
-    items = list(ds)
-
-    def build(row):
-        return build_hellaswag_prompt(row), LETTERS[int(row['label'])]
-
-    return _run_batched(items, build, extract_choice, cfg, 'Hellaswag', None)
+    rows = oc_data.load_hellaswag()
+    rows = rows[:limit] if limit else rows
+    print(f"\n  HellaSwag: {len(rows)} items (validation), zero-shot, option letter")
+    return _mc_eval('hellaswag', 'HellaSwag', rows, cfg, build_hellaswag_prompt)
 
 
 def eval_arc_c(limit=None):
-    from datasets import load_dataset
+    from oc_tasks import data as oc_data
     cfg = BENCH_CONFIG['arc_c']
-    ds = load_dataset('allenai/ai2_arc', 'ARC-Challenge', split='test')
-    if limit:
-        ds = ds.select(range(min(limit, len(ds))))
+    rows = oc_data.load_arc('arc_c')
+    rows = rows[:limit] if limit else rows
+    print(f"\n  ARC-Challenge: {len(rows)} items (test, 4-option), zero-shot gen 512, option letter")
+    return _mc_eval('arc_c', 'ARC-C', rows, cfg, build_arc_prompt)
 
-    items = list(ds)
 
-    def build(row):
-        return build_arc_c_prompt(row)  # already returns (prompt, gold)
+def eval_arc_e(limit=None):
+    """ARC-Easy on the pre-registered 800-item subset (see oc_tasks.data).
 
-    return _run_batched(items, build, extract_choice, cfg, 'ARC-C', None)
+    Not a main-table column: ARC-E has no official LLaDA-Instruct config, so it
+    inherits ARC-C's sampler and serves as a mechanism diagnostic.  The subset
+    is fixed across arms, so the paired comparison is unaffected; the cached
+    answers for rows outside it stay on disk unused.
+    """
+    from oc_tasks import data as oc_data
+    cfg = BENCH_CONFIG['arc_e']
+    rows = oc_data.arc_e_subset(oc_data.load_arc('arc_e'))
+    rows = rows[:limit] if limit else rows
+    print(f"\n  ARC-Easy: {len(rows)} items (pre-registered subset of the "
+          f"4-option test set, seed {oc_data.ARC_E_SUBSET_SEED}), "
+          f"zero-shot gen {cfg['gen_length']}, option letter")
+    return _mc_eval('arc_e', 'ARC-E', rows, cfg, build_arc_prompt)
+
+
+def eval_piqa(limit=None):
+    from oc_tasks import data as oc_data
+    cfg = BENCH_CONFIG['piqa']
+    rows = oc_data.load_piqa()
+    rows = rows[:limit] if limit else rows
+    print(f"\n  PIQA: {len(rows)} items (validation), zero-shot, option letter")
+    return _mc_eval('piqa', 'PIQA', rows, cfg, build_piqa_prompt)
 
 
 def eval_gsm8k(limit=None):
@@ -1022,6 +1483,57 @@ def eval_math(limit=None):
     return n_correct / n_total if n_total > 0 else 0.0, n_total
 
 
+def eval_math500(limit=None):
+    """MATH-500 (HuggingFaceH4/MATH-500), the subset the Traj-SVD plan asks for.
+
+    Identical to ``eval_math`` in prompt format, few-shot block, and sampler
+    settings; only the test set differs.  ``eval_math`` concatenates all seven
+    Hendrycks categories (about 5000 problems), so ``--limit 500`` on it would
+    return 500 algebra problems rather than MATH-500.
+    """
+    from datasets import load_dataset, concatenate_datasets
+    cfg = BENCH_CONFIG['math']
+    MATH_CATS = ['algebra', 'counting_and_probability', 'geometry',
+                 'intermediate_algebra', 'number_theory', 'prealgebra', 'precalculus']
+    train_ds = concatenate_datasets(
+        [load_dataset('EleutherAI/hendrycks_math', c, split='train') for c in MATH_CATS])
+    fewshot = list(train_ds.select(range(cfg['num_fewshot'])))
+
+    test_ds = load_dataset('HuggingFaceH4/MATH-500', split='test')
+    if limit:
+        test_ds = test_ds.select(range(min(limit, len(test_ds))))
+
+    items = list(test_ds)
+    bs = args.batch_size
+    n_correct = n_total = 0
+    recs = []
+    for start in tqdm(range(0, len(items), bs), desc='MATH-500', leave=False):
+        batch = items[start:start + bs]
+        prompts = [build_math_prompt(row, fewshot) for row in batch]
+        golds   = [math_gold(row['solution']) for row in batch]
+        try:
+            gens = gen_responses(prompts, cfg['gen_length'], cfg['block_length'], cfg['steps'],
+                                 cfg['logits_eos_inf'], cfg['confidence_eos_eot_inf'])
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() and bs > 1:
+                torch.cuda.empty_cache()
+                gens = [gen_response(p, cfg['gen_length'], cfg['block_length'], cfg['steps'],
+                                     cfg['logits_eos_inf'], cfg['confidence_eos_eot_inf'])
+                        for p in prompts]
+            else:
+                raise
+        for j, (gen, gold) in enumerate(zip(gens, golds)):
+            pred = extract_boxed(gen)
+            ok = bool(math_match(pred, gold))
+            if ok:
+                n_correct += 1
+            n_total += 1
+            recs.append({'idx': start + j, 'gold': None if gold is None else str(gold),
+                         'pred': None if pred is None else str(pred), 'correct': ok})
+    PER_ITEM['math500'] = recs
+    return n_correct / n_total if n_total > 0 else 0.0, n_total
+
+
 def eval_gpqa(limit=None):
     from datasets import load_dataset
     import os as _os
@@ -1099,9 +1611,19 @@ EVALUATORS = {
     'mmlu_pro':  eval_mmlu_pro,
     'hellaswag': eval_hellaswag,
     'arc_c':     eval_arc_c,
+    'arc_e':     eval_arc_e,
+    'piqa':      eval_piqa,
     'gsm8k':     eval_gsm8k,
+    'math500':   eval_math500,
     'math':      eval_math,
     'gpqa':      eval_gpqa,
+    'humaneval': eval_humaneval,
+    'mbpp':      eval_mbpp,
+    'ifeval':    eval_ifeval,
+    'bbh':       eval_bbh,
+    'svamp':        eval_svamp,
+    'aime':         eval_aime,
+    'minerva_math': eval_minerva_math,
 }
 
 print(f"\n[3/3] Running benchmarks: {BENCHMARKS}")
@@ -1155,6 +1677,13 @@ for bench in BENCHMARKS:
     elapsed = (time.time() - t_bench) / 60
     print(f"  [{bench}] acc={acc*100:.2f}%  n={n}  time={elapsed:.1f}min{delta}")
     results[bench] = {'acc': round(acc, 6), 'n': n}
+    # IFEval reports four accuracies and BBH a per-subtask breakdown; `acc`
+    # keeps the headline cut and the rest is carried alongside it.
+    if bench in EXTRA_METRICS:
+        results[bench].update(EXTRA_METRICS[bench])
+        for key, value in EXTRA_METRICS[bench].items():
+            if isinstance(value, float):
+                print(f"    {key:24s} {value*100:6.2f}%")
 
     # Checkpoint after each benchmark
     _ckpt = (args.output or os.path.join(
@@ -1202,11 +1731,14 @@ with open(args.output, 'w') as f:
         'results':      results,
         'time_min':     round(total_min, 1),
         'limit':        args.limit,
+        'bbh_per_subtask': args.bbh_per_subtask,
+        'bench_config': {b: BENCH_CONFIG[b] for b in results if b in BENCH_CONFIG},
         # provenance: which weights actually produced these numbers (no-cross-source guard)
         'weights_path': getattr(args, 'weights_path', None),
         'model_path':   getattr(args, 'model_path', None),
         # per-item correctness -> enables paired McNemar between arms
         'per_item':     PER_ITEM,
+        'gen_diag':     _gen_diag_summary(),
     }, f, indent=2)
 print(f"  Results saved: {args.output}")
 print("Done.")

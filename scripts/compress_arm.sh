@@ -33,4 +33,4 @@ if [[ -n "${XTX_BUDGET_GB:-}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
-python -m trajmc.compression "${ARGS[@]}" "$@"
+"${PYTHON_BIN:-python}" -m trajmc.compression "${ARGS[@]}" "$@"

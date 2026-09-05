@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "${ROOT_DIR}/scripts/lib.sh"
 BACKEND="${1:-llada}"
 STAGE="${STAGE:-calibrate}"
 CORPUS="${CORPUS:-c4}"
@@ -40,27 +42,28 @@ if [[ "${CORPUS}" == "c4" && "${C4_STREAMING:-1}" == "1" ]]; then
 fi
 
 cd "${ROOT_DIR}"
-for scheme in "${SCHEMES[@]}"; do
-  python -m trajmc.calibration "${COMMON[@]}" --scheme "${scheme}"
-done
 
-GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
-AUDIT_ARGS=()
+# Preflight: resolve every target path before any GPU work.  The rollout arm is
+# the expensive one, so a naming or configuration problem has to surface here,
+# not after it has run.
 declare -A CALIBRATIONS
 for scheme in "${SCHEMES[@]}"; do
-  path="$(find "${CALIB_DIR}" -maxdepth 1 -type f \
-    -name "${BACKEND}_${scheme}_${CORPUS}_n*_s${SEED}_full_${GIT_HASH}_calib.pt" \
-    -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
-  if [[ -z "${path}" ]]; then
-    echo "Could not find ${scheme} calibration under ${CALIB_DIR}" >&2
-    exit 1
-  fi
-  CALIBRATIONS["${scheme}"]="${path}"
-  AUDIT_ARGS+=(--calib "${scheme}=${path}")
+  CALIBRATIONS["${scheme}"]="$(calib_artifact_path "${COMMON[@]}" --scheme "${scheme}")"
+  echo "[ablation] ${scheme} -> ${CALIBRATIONS[${scheme}]}"
+done
+
+for scheme in "${SCHEMES[@]}"; do
+  "${PYTHON_BIN}" -m trajmc.calibration "${COMMON[@]}" --scheme "${scheme}"
+  require_calib_artifact "${CALIBRATIONS[${scheme}]}" "${scheme}"
+done
+
+AUDIT_ARGS=()
+for scheme in "${SCHEMES[@]}"; do
+  AUDIT_ARGS+=(--calib "${scheme}=${CALIBRATIONS[${scheme}]}")
 done
 
 mkdir -p "${REPORT_DIR}"
-python -m analysis.calibration_ablation \
+"${PYTHON_BIN}" -m analysis.calibration_ablation \
   "${AUDIT_ARGS[@]}" \
   --out "${REPORT_DIR}/calibration_audit.json"
 

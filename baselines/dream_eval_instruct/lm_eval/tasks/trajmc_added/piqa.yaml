@@ -1,0 +1,27 @@
+# [trajmc] NOT part of the official Dream *Instruct* suite; see the header of
+# trajmc_added/hellaswag/hellaswag.yaml for the rationale.  Protocol comes from
+# eval/eval_dream_mc.sh (0-shot, batch_size 32, add_bos_token=true, no chat
+# template).  The yaml is upstream lm-evaluation-harness's piqa.yaml with only
+# the dataset pointer changed from the local-parquet hack in the installed copy
+# back to the Hub repo, which resolves on the datasets version this toolkit runs.
+task: piqa
+dataset_path: ybisk/piqa
+dataset_name: null
+output_type: multiple_choice
+training_split: null
+validation_split: validation
+test_split: null
+doc_to_text: "Question: {{goal}}\nAnswer:"
+doc_to_target: label
+doc_to_choice: "{{[sol1, sol2]}}"
+should_decontaminate: true
+doc_to_decontamination_query: goal
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
