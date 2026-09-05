@@ -1,0 +1,65 @@
+{
+  "gate": "PASS",
+  "all_clean_windows_byte_identical": true,
+  "artifacts": {
+    "clean_t0": "/home/tl356/traj-mc/results/stage_a/dream_instruct_r0.8/calib/dream_instruct_clean_t0_c4_n256_s42_full_8ff961b_calib.pt",
+    "random_t": "/home/tl356/traj-mc/results/stage_a/dream_instruct_r0.8/calib/dream_instruct_random_t_c4_n256_s42_full_8ff961b_calib.pt",
+    "grid_t_prefix": "/home/tl356/traj-mc/results/stage_a/dream_instruct_r0.8/calib/dream_instruct_grid_t_prefix_p0p25_c4_n256_s42_full_8ff961b_calib.pt"
+  },
+  "schemes": {
+    "clean_t0": {
+      "scheme": "clean_t0",
+      "shape": [
+        256,
+        2048
+      ],
+      "clean_windows_match": true,
+      "matched_arm": true,
+      "prompt_source": null,
+      "mean_t": 0.0,
+      "mean_full_mask_ratio": 0.0,
+      "mean_suffix_mask_ratio": 0.0,
+      "prefix_length": 0,
+      "prefix_byte_identical": true,
+      "grid_exact": null,
+      "visible_prediction_mismatches_vs_clean": 0,
+      "model_prediction_feedback": false
+    },
+    "random_t": {
+      "scheme": "random_t",
+      "shape": [
+        256,
+        2048
+      ],
+      "clean_windows_match": true,
+      "matched_arm": true,
+      "prompt_source": null,
+      "mean_t": 0.47284500021487474,
+      "mean_full_mask_ratio": 0.47292137145996094,
+      "mean_suffix_mask_ratio": 0.47292137145996094,
+      "prefix_length": 0,
+      "prefix_byte_identical": true,
+      "grid_exact": null,
+      "visible_prediction_mismatches_vs_clean": 0,
+      "model_prediction_feedback": false
+    },
+    "grid_t_prefix": {
+      "scheme": "grid_t_prefix",
+      "shape": [
+        256,
+        2048
+      ],
+      "clean_windows_match": true,
+      "matched_arm": true,
+      "prompt_source": null,
+      "mean_t": 0.501953125,
+      "mean_full_mask_ratio": 0.37612342834472656,
+      "mean_suffix_mask_ratio": 0.5014979243278503,
+      "prefix_length": 512,
+      "prefix_byte_identical": true,
+      "grid_exact": true,
+      "visible_prediction_mismatches_vs_clean": 0,
+      "model_prediction_feedback": false
+    }
+  }
+}

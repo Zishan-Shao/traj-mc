@@ -40,8 +40,103 @@ Each factor directory holds 392 files named
 `model_layers_<i>_<proj>_A.pt` / `_B.pt` plus a `compression_summary.json`.
 Copy them whole; a partial directory will be detected and refused.
 
-If 180 GB is impractical, run `dense` first and ask for the compressed
-directories one at a time.
+If 180 GB is impractical — and it usually is — **build the factors locally
+instead**: the calibration tensors they are derived from are 19 MB and ship
+with this repo. See §2b. Transferring 180 GB will typically take longer than
+recompressing.
+
+Either way `dense` needs no factors at all, so it can start immediately.
+
+---
+
+## 2b. Building the compressed cells yourself (recommended)
+
+The expensive input to compression is the calibration tensor, and those are
+already in the repo at
+`results/stage_a/dream_instruct_r0.8/calib/` (19 MB, three files):
+
+| File | Scheme | Feeds arm |
+| --- | --- | --- |
+| `dream_instruct_clean_t0_c4_n256_s42_full_8ff961b_calib.pt` | clean text, t = 0 | `*_clean` |
+| `dream_instruct_random_t_c4_n256_s42_full_8ff961b_calib.pt` | one t ~ U(0,1) per window | `*_traj` |
+| `dream_instruct_grid_t_prefix_p0p25_c4_n256_s42_full_8ff961b_calib.pt` | stratified grid + 25% visible prefix | `*_mcs` — **not in this table**, ignore unless asked |
+
+Each is 256 windows of 2048 C4 tokens, seed 42. `*_weight_svd` needs no
+calibration at all (it is a plain SVD of the weight matrix).
+
+Do **not** regenerate them. They are the shared input every arm is matched on;
+a fresh draw would silently break that matching. If you must know they are
+intact, `results/stage_a/dream_instruct_r0.8/reports/calibration_audit.json`
+records the audit that every arm shares byte-identical pre-noise windows.
+
+### Commands
+
+Six runs, one per cell. `--ratio` is the parameter **retention** fraction, so
+0.8 is the 20%-reduction row and 0.6 the 40% one.
+
+```bash
+CALIB=results/stage_a/dream_instruct_r0.8/calib
+MODEL=/path/to/Dream-v0-Instruct-7B
+
+for RATIO in 0.8 0.6; do
+  TAG=r0${RATIO#0.}          # 0.8 -> r08, 0.6 -> r06
+
+  # weight_svd: no calibration, plain SVD of W
+  python -m trajmc.compression --backend dream_instruct --model_path "$MODEL" \
+    --ratio "$RATIO" --layer_type all --decomp identity \
+    --save_path "weights/${TAG}_weight_svd" \
+    --save_dtype bfloat16 --linalg_device cuda --batch_size 1 \
+    --run_id "${TAG}_weight_svd"
+
+  # clean and traj: activation-weighted SVD, one calibration each
+  for ARM in clean traj; do
+    case $ARM in
+      clean) C="$CALIB/dream_instruct_clean_t0_c4_n256_s42_full_8ff961b_calib.pt" ;;
+      traj)  C="$CALIB/dream_instruct_random_t_c4_n256_s42_full_8ff961b_calib.pt" ;;
+    esac
+    python -m trajmc.compression --backend dream_instruct --model_path "$MODEL" \
+      --ratio "$RATIO" --layer_type all --decomp cholesky --calib "$C" \
+      --save_path "weights/${TAG}_${ARM}" \
+      --save_dtype bfloat16 --linalg_device cuda --batch_size 1 \
+      --run_id "${TAG}_${ARM}"
+  done
+done
+```
+
+Point `weights_path=` at these `weights/<cell>` directories when you run the
+evaluation.
+
+### What a finished cell looks like
+
+392 factor files (`model_layers_<i>_<proj>_A.pt` / `_B.pt`, 196 Linears × 2)
+plus `compression_summary.json`. Check the summary before trusting a cell:
+
+```
+n_target_linears  196     # 28 decoder layers x 7 projections
+n_compressed      196     # every one of them replaced
+kept_fraction     ~=ratio # measured, e.g. 0.5999 for --ratio 0.6
+factor_file_dtype bfloat16
+```
+
+`n_compressed` below 196, or a missing summary, means the run did not finish —
+delete the directory and rerun rather than evaluating a half-written cell.
+Embedding and `lm_head` are never compressed; that is deliberate and matches
+SVD-LLM / ASVD practice.
+
+### Cost, measured on one L40S
+
+**About 3 hours per cell**, 6 cells ≈ 18 GPU-hours, and they are fully
+independent so run them in parallel. Each cell writes ~30 GB, so budget
+~180 GB of disk. Peak host RAM was 55 GB; 110 GB is a safe request.
+
+Two traps we hit:
+
+- **Do not set a wall limit under 4 hours.** Our first batch was submitted with
+  90 minutes and all eight arms were killed at 1:30:13 with the output
+  directories 80% written.
+- **A half-written directory is not detected by the compressor on rerun.** Wipe
+  `weights/<cell>` before restarting it, or the new run mixes with the old
+  files.
 
 ---
 
