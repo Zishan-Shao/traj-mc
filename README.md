@@ -1,221 +1,127 @@
-# Traj-MC
+# Traj-MC: Trajectory-Aware Low-Rank Compression for Diffusion Language Models
 
-Core implementation of trajectory-matched calibration (Traj-MC) for masked
-diffusion language models. The repository contains the current random-`t`
-method for both LLaDA and Dream in one `trajmc` package, with evaluation,
-analysis, scripts, utilities, and external baselines separated at the repository
-root.
+Code for *Preserving Mathematical Reasoning in Compressed Diffusion Language
+Models via Trajectory-Aware Low-Rank Approximation* (MATH-AI Workshop,
+NeurIPS 2026).
 
-No model checkpoints, calibration tensors, datasets, raw evaluation outputs,
-or generated low-rank factors are included.
+Activation-aware low-rank methods such as SVD-LLM calibrate on clean, fully
+visible text, but a diffusion LM spends inference on partially masked states.
+Traj-MC estimates the second moment that defines the low-rank objective from
+trajectory states instead: for each calibration window it samples a corruption
+level `t ~ U(0, 1)` and masks every token independently with probability `t`,
+accumulates `Sigma_N = (1/N) sum h h^T`, and applies the whitened SVD-LLM
+solution `(W S_N)_k S_N^{-1}`. Compressed layers and rank allocation are
+unchanged; only the calibration states differ.
 
-## Method
+## Layout
 
-The original Traj-MC comparison changes only the calibration inputs used by
-activation-aware low-rank compression:
+```
+trajmc/            core method
+  calibration.py     builds calibration windows: clean (t = 0), Traj-MC (t ~ U(0,1)),
+                     fixed t, and held-out generation states from the dense sampler
+  sampling.py        masking operator and diffusion-sampler state capture
+  compression.py     second-moment accumulation and whitened truncated SVD
+  common.py          model loading, backends (LLaDA, Dream), target layers
+  analysis/          measurements: E_gen, second-moment error, subspace distance,
+                     and the calibration audit (identical windows across arms)
+scripts/           bash scripts that reproduce the paper's experiments
+utils/             shared evaluation code
+  eval_benchmarks.py LLaDA benchmark harness (LLaDA's OpenCompass protocols)
+  generate.py        LLaDA low-confidence block sampler
+  oc_tasks/          dataset loaders and answer graders
+  dream_eval_instruct/  Dream's official Instruct evaluation toolkit (lm-eval fork)
+  collect_results.py prints Table 1 and the figure numbers from results/
+tests/             unit tests (pytest)
+```
 
-- `base`: clean token windows (`t = 0`);
-- `ours`: sample one `t ~ Uniform(0, 1)` per window and independently replace
-  each token with the model's mask token with probability `t`.
-
-Given the same seed, both arms use byte-identical clean windows before masking.
-The covariance collection, whitening, rank formula, and truncation path are
-shared, making the comparison single-variable.
-
-### Sampling ablation
-
-The unified calibration command also exposes the four-way distribution
-ablation needed to distinguish iid timestep sampling, MCS-style stratification,
-prefix geometry, and model feedback:
-
-| Scheme | Timestep design | Visible prefix | State source |
-| --- | --- | ---: | --- |
-| `random_t` | iid `Uniform(0,1)` | 0% | independent clean-token corruption |
-| `grid_t` | exact `1/N,...,1` grid | 0% | independent clean-token corruption |
-| `grid_t_prefix` | exact `1/N,...,1` grid | 25% default | independent clean-token corruption |
-| `rollout` | same grid mapped to native sampler calls | 25% default | dense-model reverse trajectory |
-
-The first three never feed predictions back into later states. `rollout`
-records actual pre-forward sampler states, so revealed model predictions and
-their errors persist. All four schemes use byte-identical clean windows for a
-fixed corpus, seed, sequence length, and sample count.
-
-Build and audit the four calibration artifacts:
+## Installation
 
 ```bash
-NSAMPLES=256 scripts/run_sampling_ablation.sh llada
-NSAMPLES=256 scripts/run_sampling_ablation.sh dream
+pip install -e ".[eval,test]"
+pip install -e "utils/dream_eval_instruct[ifeval,math]"   # only for the Dream evaluation
 ```
 
-Set `STAGE=all` to run compression after the calibration audit. The default
-stops after calibration because closed-loop collection is GPU-intensive.
+We used Python 3.10. Calibration and compression ran with torch 2.10 and
+transformers 4.49; the LLaDA benchmarks ran with torch 2.1.2 and
+transformers 4.45.2. All steps run on a single GPU. A 24 GB card is
+enough for LLaDA. Dream compression needs about 32 GB with
+`LINALG_DEVICE=cuda`; on a smaller card, use `LINALG_DEVICE=cpu`.
 
-## Supported backends
+Model paths default to the Hugging Face IDs (`GSAI-ML/LLaDA-8B-Instruct`,
+`Dream-org/Dream-v0-Instruct-7B`). To use local copies, set `LLADA_PATH` and
+`DREAM_PATH`. Set `PYTHON_BIN` to choose the interpreter. All outputs are
+written under `results/`.
 
-| Backend | Default model | Mask ID | Compressed Linear layers |
-| --- | --- | ---: | ---: |
-| `llada` | `GSAI-ML/LLaDA-8B-Base` | 126336 | 224 (32 × 7) |
-| `dream` | `Dream-org/Dream-v0-Base-7B` | 151666 | 196 (28 × 7) |
+## Reproducing the paper
 
-The embedding and output head always remain dense. A model-graph check aborts
-if the expected backend layout has changed.
-
-## Install
-
-Python 3.10+ and a CUDA-enabled PyTorch environment are recommended.
+| Paper | Script | Output |
+|---|---|---|
+| Table 1, LLaDA-8B-Instruct, compression | `scripts/llada_compress.sh` | `results/llada_instruct/r{0.8,0.6}/weights/` |
+| Table 1, LLaDA-8B-Instruct, benchmarks | `scripts/llada_eval.sh` | `results/llada_instruct/eval/` |
+| Table 1, Dream-7B-Instruct, compression | `scripts/dream_compress.sh` | `results/dream_instruct/r0.8/weights/` |
+| Table 1, Dream-7B-Instruct, benchmarks | `scripts/dream_eval.sh` | `results/dream_instruct/eval/` |
+| Fig. 1b, E_gen on held-out generation states | `scripts/llada_compress.sh` (measure stage) | `results/llada_instruct/reports/gen_reconstruction_r0.8_*.json` |
+| Fig. 2a, fixed t vs. t ~ U(0,1) | `scripts/fixed_t.sh` | `results/llada_instruct/reports/fixed_t_r0.8_*.json` |
+| Fig. 2b, Monte Carlo convergence | `scripts/mc_budget.sh` | `results/llada_instruct/reports/mc_budget_covariance.json` |
 
 ```bash
-pip install -e .
-pip install -e '.[eval]'  # only when running lm-eval
+bash scripts/llada_compress.sh      # calibrate, compress 20% and 40%, measure E_gen
+bash scripts/llada_eval.sh          # GSM8K, MATH-500, SVAMP, ARC-C, MMLU, HellaSwag, PIQA
+bash scripts/fixed_t.sh             # needs llada_compress.sh
+bash scripts/mc_budget.sh           # needs llada_compress.sh
+bash scripts/dream_compress.sh
+bash scripts/dream_eval.sh
+python utils/collect_results.py     # print every table cell and figure value
 ```
 
-Remote model code is loaded through Hugging Face Transformers. You can pass a
-local checkpoint directory with `--model_path` to every command.
+Each script skips any step whose output already exists, so an interrupted run
+can be restarted. The compression scripts also take `STAGE=calibrate|compress|measure`.
 
-## 1. Build paired calibration sets
+### Settings
 
-Use the same backend, corpus, seed, sequence length, and sample count for both
-arms:
+- **Calibration.** Every activation-aware arm uses the same 256 C4 windows of
+  2048 tokens (window seed 42). A byte-level audit checks that the windows are
+  identical across arms before compression; only the masking differs.
+- **Compression.** `RATIO` is the retained parameter fraction. 0.8 means 20%
+  reduction and 0.6 means 40%. All arms of a model use the same layers and the
+  same rank allocation. *SVD* is a plain truncated SVD of `W`.
+  *SVD-LLM* is whitening on clean windows. *+Traj-MC* is whitening on
+  trajectory windows.
+- **LLaDA** compresses all seven linear layers in every block and uses a
+  Cholesky factor of `Sigma_N`.
+- **Dream** keeps the GQA `k_proj`/`v_proj` dense (`LAYER_TYPE=nokv`: 140
+  linears, 80.3% of parameters kept). Its MLP second moments are numerically
+  singular in float32, so it uses an eigendecomposition with a relative
+  eigenvalue floor (`--decomp eigh --rcond 1e-10`).
+- **Evaluation.** Each model follows its official protocol.
+  - *LLaDA* uses the OpenCompass configurations from the LLaDA repository,
+    with generative evaluation and the low-confidence block sampler.
+  - *Dream* uses its Instruct toolkit with the chat template, temperature 0.1,
+    top-p 0.9, and the entropy remasking order. GSM8K is scored on the first
+    512 test items, and MMLU on the first 40 items of each subject.
+    HellaSwag, PIQA and ARC-C use Dream's Base multiple-choice protocol.
+    SVAMP uses the GSM8K row.
+- **Second-moment error (Fig. 2b).** Relative Frobenius error of `Sigma_N`
+  against an independent 256-window Traj-MC draw (window seed 31337),
+  averaged over three probe layers (`blocks.0.attn_out`, `blocks.16.attn_out`,
+  `blocks.31.up_proj`). Each moment is accumulated exactly on a fixed set of
+  256 randomly chosen input coordinates per layer (`--sketch_dim 256`,
+  `--sketch_seed 2027`), not on the full `d x d` matrix.
+- **E_gen.** Measured on real reverse-sampler states of the dense model for
+  256 held-out GSM8K test prompts (seed 1337, 4-shot, generation length 256,
+  block 8, 256 steps), restricted to the generation region. Confidence
+  intervals come from 2000 paired bootstrap resamples over prompts.
+
+## Tests
 
 ```bash
-trajmc-calibrate \
-  --backend llada --arm base --corpus c4 --c4_streaming \
-  --nsamples 256 --seqlen 2048 --seed 42
-
-trajmc-calibrate \
-  --backend llada --arm ours --corpus c4 --c4_streaming \
-  --nsamples 256 --seqlen 2048 --seed 42
+pytest tests
 ```
 
-Replace `llada` with `dream` to run the same random-`t` construction on Dream.
-Calibration artifacts are written under `results/calib/<backend>/` by default.
+Set `LLADA_INSTRUCT_PATH` to a local LLaDA-8B-Instruct checkout to also run the
+prompt-construction tests.
 
-## 2. Compress
+## License
 
-Run the identical command for the two calibration files, changing only
-`--calib` and `--save_path`:
-
-```bash
-trajmc-compress \
-  --backend llada \
-  --calib results/calib/llada/<base-calibration>.pt \
-  --ratio 0.8 --layer_type all --decomp cholesky \
-  --save_path results/weights/llada/base
-
-trajmc-compress \
-  --backend llada \
-  --calib results/calib/llada/<ours-calibration>.pt \
-  --ratio 0.8 --layer_type all --decomp cholesky \
-  --save_path results/weights/llada/ours
-```
-
-`ratio` is the target retained parameter fraction:
-
-```text
-k = int(ratio * out_features * in_features / (out_features + in_features))
-```
-
-The output contains per-layer `A`/`B` factors and a
-`compression_summary.json`. All generated artifacts live under ignored paths.
-
-Verify that BASE and OURS differ only in calibration identity/runtime fields:
-
-```bash
-python -m analysis.summary_diff \
-  --base results/weights/llada/base \
-  --ours results/weights/llada/ours
-```
-
-## 3. Evaluate
-
-The package includes the LLaDA and Dream lm-eval adapters used by the current
-experiments:
-
-```bash
-trajmc-evaluate \
-  --backend llada --task piqa --arm ours \
-  --weights results/weights/llada/ours
-
-trajmc-evaluate \
-  --backend dream --task gsm8k_cot --arm ref
-```
-
-Add `--dry` to inspect the generated `accelerate` command without running it.
-Supported tasks and their fixed per-backend protocols live in
-`trajmc/common.py`.
-
-To produce paired records and run McNemar's test:
-
-```bash
-trajmc-items --backend llada --task piqa --arm base
-trajmc-items --backend llada --task piqa --arm ours
-
-python -m analysis.mcnemar \
-  --base_items <base-items.jsonl> \
-  --ours_items <ours-items.jsonl> \
-  --benchmark piqa
-```
-
-## Repository layout
-
-```text
-trajmc/                      # method implementation only
-├── calibration.py          # shared clean-t0 / random-t construction
-├── compression.py          # shared covariance + whitening + truncation
-├── sampling.py             # grid/MCS and real rollout state collectors
-└── common.py               # LLaDA/Dream backend specifications
-eval/                       # launcher + architecture-specific lm-eval adapters
-analysis/                   # paired-item conversion and statistical gates
-baselines/                  # vendored external comparison implementations
-utils/                      # standalone legacy/reproducibility helpers
-scripts/                    # local and Slurm entry points
-tests/                      # CPU-only core tests
-```
-
-The source trees in `baselines/` preserve their upstream licenses and notices;
-nested Git metadata, figures, checkpoints, datasets, caches, and raw results are
-not included. See `baselines/README.md` before running a baseline.
-
-The evaluation adapters retain attribution comments to their upstream LLaDA,
-Sink-Aware, and Dream sources. Model weights and datasets remain governed by
-their respective upstream licenses.
-
-## Convenience scripts
-
-Run both clean-`t0` and random-`t` calibration arms:
-
-```bash
-scripts/calibrate_pair.sh llada
-```
-
-Run the full calibration + compression pair:
-
-```bash
-NSAMPLES=256 RATIO=0.8 scripts/run_random_t.sh llada
-```
-
-The same scripts accept `dream`. Environment variables and Slurm templates are
-documented in `scripts/README.md`; generated artifacts always default to the
-ignored `results/` tree.
-
-## Covariance-estimator diagnostic
-
-`analysis.covariance_estimation` measures dense-model activation second moments
-on the same deterministic coordinate subspaces for every scheme. Supply a
-larger, independently generated calibration artifact as the reference and
-repeat iid random-`t` over multiple seeds:
-
-```bash
-python -m analysis.covariance_estimation \
-  --backend llada \
-  --calib reference=<large-reference.pt> \
-  --calib random_s42=<random-t-s42.pt> \
-  --calib grid=<grid-t.pt> \
-  --reference reference \
-  --out results/ablation/reports/llada/covariance.json
-```
-
-This test can support an iid advantage only if random-`t` has lower error or
-bias against the independent reference across seeds. A fixed grid may instead
-win through lower finite-sample variance; the experiment is designed to report
-that outcome honestly as well.
+MIT (see `LICENSE`). Third-party components and their licenses are listed in
+`THIRD_PARTY_NOTICES.md`.

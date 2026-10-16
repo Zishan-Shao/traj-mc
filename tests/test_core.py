@@ -1,4 +1,5 @@
 import tempfile
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -7,7 +8,12 @@ import torch.nn as nn
 
 from trajmc import common
 from trajmc.calibration import apply_noise
-from trajmc.compression import plan_bins, whiten_truncate
+from trajmc.compression import (
+    eigh_factor,
+    plan_bins,
+    relative_error,
+    whiten_truncate,
+)
 from trajmc.sampling import (
     apply_forward_mask,
     dream_rollout_states,
@@ -17,9 +23,8 @@ from trajmc.sampling import (
     rollout_call_indices_for_transfers,
     uniform_grid,
 )
-from eval.run import build_command
-from analysis.calibration_ablation import audit_blob
-from analysis.covariance_estimation import collect_moments, compare_moments
+from trajmc.analysis.calibration_ablation import audit_blob
+from trajmc.analysis.covariance_estimation import collect_moments, compare_moments
 
 
 class LLaDABlock(nn.Module):
@@ -169,17 +174,6 @@ class CoreTests(unittest.TestCase):
         modules = [("a", nn.Linear(4, 4)), ("b", nn.Linear(4, 4))]
         self.assertEqual(len(plan_bins(modules, budget_bytes=64)), 2)
 
-    def test_evaluation_dry_commands_select_backend_harness(self):
-        with tempfile.TemporaryDirectory() as output:
-            llada, _, _ = build_command(
-                "llada", "piqa", "ref", "model", None, 1, "2", output
-            )
-            dream, _, _ = build_command(
-                "dream", "piqa", "ref", "model", None, 1, "2", output
-            )
-        self.assertTrue(any(value.endswith("llada_harness.py") for value in llada))
-        self.assertTrue(any(value.endswith("dream_harness.py") for value in dream))
-
     def test_grid_and_random_scheme_resolution(self):
         self.assertEqual(resolve_scheme("ours", None), ("random_t", "ours"))
         self.assertEqual(resolve_scheme(None, "grid_t"), ("grid_t", "grid_t"))
@@ -187,6 +181,88 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(torch.equal(
             rollout_call_indices(grid, 8), torch.arange(7, -1, -1)
         ))
+
+    def test_relative_error_is_zero_for_an_exact_factorisation(self):
+        torch.manual_seed(0)
+        W = torch.randn(12, 8)
+        U, S, Vt = torch.linalg.svd(W, full_matrices=False)
+        A, B = U * S, Vt
+        self.assertLess(relative_error(W, A, B), 1e-6)
+
+    def test_rcond_floor_is_a_no_op_on_a_well_conditioned_covariance(self):
+        # The paper claim the floor rests on: it only touches directions the
+        # calibration never resolved.  On a spectrum far above the threshold it
+        # must change nothing, so a shared floor cannot quietly alter the arms
+        # whose statistics were fine.
+        torch.manual_seed(0)
+        Q, _ = torch.linalg.qr(torch.randn(16, 16))
+        spectrum = torch.linspace(1.0, 4.0, 16, dtype=torch.float64)
+        XtX = (Q.double() * spectrum) @ Q.double().T
+        plain = eigh_factor(XtX, rcond=0.0)
+        floored = eigh_factor(XtX, rcond=1e-6)
+        self.assertTrue(torch.allclose(plain, floored, atol=1e-12))
+
+    def test_rcond_floor_rescues_a_numerically_singular_covariance(self):
+        # A miniature of the Dream failure.  A block of directions sits far
+        # below float32 resolution -- as Dream's shared MLP-input covariance
+        # does, at lambda_min/lambda_max = 3e-19 -- so their inverse square
+        # roots are square roots of accumulation noise.  A single tiny
+        # eigenvalue is not enough to reproduce it and would make this test
+        # pass for the wrong reason.
+        torch.manual_seed(0)
+        dim = 64
+        Q, _ = torch.linalg.qr(torch.randn(dim, dim))
+        spectrum = torch.full((dim,), 4.0, dtype=torch.float64)
+        spectrum[: dim // 8] = 1e-18
+        XtX = ((Q.double() * spectrum) @ Q.double().T).float()
+        W = torch.randn(dim, dim)
+
+        A0, B0, _ = whiten_truncate(W, XtX, 0.8, decomp="eigh", rcond=0.0)
+        A1, B1, _ = whiten_truncate(W, XtX, 0.8, decomp="eigh", rcond=1e-8)
+        Ai, Bi, _ = whiten_truncate(W, XtX, 0.8, decomp="identity")
+
+        unfloored, floored = relative_error(W, A0, B0), relative_error(W, A1, B1)
+        optimal = relative_error(W, Ai, Bi)
+        self.assertGreater(unfloored, 1.0)
+        self.assertLessEqual(floored, 1.0)
+        # Plain SVD minimises this norm, so the floored solution cannot beat it;
+        # landing just above it is what "the solve no longer diverges" means.
+        self.assertGreaterEqual(floored, optimal - 1e-6)
+        self.assertLess(floored, 1.5 * optimal)
+
+    def test_rcond_floor_bounds_the_factor_conditioning(self):
+        torch.manual_seed(0)
+        dim = 12
+        Q, _ = torch.linalg.qr(torch.randn(dim, dim))
+        spectrum = torch.full((dim,), 1.0, dtype=torch.float64)
+        spectrum[0] = 1e-20
+        XtX = (Q.double() * spectrum) @ Q.double().T
+        rcond = 1e-8
+        L = eigh_factor(XtX, rcond=rcond)
+        values = torch.linalg.svdvals(L)
+        self.assertLessEqual(
+            float(values.max() / values.min()), 1.0 / math.sqrt(rcond) * 1.01
+        )
+
+    def test_fixed_t_resolves_and_collapses_the_timestep_distribution(self):
+        self.assertEqual(resolve_scheme(None, "fixed_t"), ("fixed_t", "fixed_t"))
+        windows = torch.arange(4096).reshape(2, 2048)
+        timesteps = torch.full((2,), 0.5, dtype=torch.float64)
+        noised = apply_forward_mask(windows, timesteps, mask_id=99, seed=7)
+        rates = noised.eq(99).float().mean(dim=1)
+        # Every row sits at the same nominal t, so the realised mask rates
+        # concentrate there instead of spreading over [0, 1] as random_t does.
+        self.assertTrue(bool(((rates - 0.5).abs() < 0.05).all()))
+
+    def test_fixed_t_at_zero_reproduces_the_clean_arm_exactly(self):
+        # The t = 0 cell of the fixed-t ablation is not run separately: it is
+        # the existing clean_t0 arm.  That reuse is only sound while the two
+        # constructions agree byte for byte.
+        windows = torch.arange(64).reshape(4, 16)
+        noised = apply_forward_mask(
+            windows, torch.zeros(4, dtype=torch.float64), mask_id=99, seed=7
+        )
+        self.assertTrue(torch.equal(noised, windows))
 
     def test_prefix_grid_preserves_prefix_and_masks_suffix(self):
         windows = torch.arange(32).reshape(4, 8)

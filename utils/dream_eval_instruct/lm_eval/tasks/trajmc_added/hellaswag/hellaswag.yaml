@@ -1,0 +1,37 @@
+# [trajmc] NOT part of the official Dream *Instruct* suite.
+#
+# Dream publishes these two multiple-choice tasks only for the BASE model, in
+# eval/eval_dream_mc.sh:
+#     --tasks "mmlu arc_easy arc_challenge hellaswag piqa gpqa_main_n_shot winogrande race"
+#     --num_fewshot 0 (for hellaswag/piqa)  --batch_size 32
+#     --model_args pretrained=...,add_bos_token=true      # no chat template
+# so that is the protocol used here, verbatim, rather than inventing one: it is
+# the only official Dream configuration these tasks have.  The consequence,
+# which the table note must state, is that the HellaSwag and PIQA columns are
+# scored by conditional likelihood WITHOUT a chat template, while the columns
+# from eval_instruct/ (MMLU, GSM8K, MATH, GPQA) are generative WITH one.
+#
+# The yaml itself is upstream lm-evaluation-harness's hellaswag.yaml unchanged;
+# utils.py beside it is likewise upstream.
+tag:
+  - multiple_choice
+task: hellaswag
+dataset_path: Rowan/hellaswag
+dataset_name: null
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+test_split: null
+process_docs: !function utils.process_docs
+doc_to_text: "{{query}}"
+doc_to_target: "{{label}}"
+doc_to_choice: "choices"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

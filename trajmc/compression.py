@@ -1,9 +1,9 @@
 """Shared activation-aware low-rank compression for LLaDA and Dream.
 
-The arm identity lives entirely in the calib file (built by calib/build_calib.py).
+The arm identity lives entirely in the calib file (built by trajmc/calibration.py).
 This module is arm-agnostic: same whitening math, same truncation, same pipeline.
 
-Faithful port of official SVD-LLM whitening (see docs/svdllm_port_diff.md):
+Faithful port of official SVD-LLM whitening:
   - single forward + forward hooks accumulate X^T X incrementally (O(d^2)/layer),
     no inps/outs buffering;
   - decomposition: torch.linalg.cholesky in fp64 with the official except branch
@@ -64,31 +64,59 @@ def cholesky_factor(XtX, solve_dtype=torch.float64):
     return L
 
 
-def eigh_factor(XtX, solve_dtype=torch.float64):
+def eigh_factor(XtX, solve_dtype=torch.float64, rcond=0.0):
     """
-    Backup symmetric square root via eigh: L = V diag(sqrt(lambda)) s.t. L L^T = XtX.
+    Symmetric square root via eigh: L = V diag(sqrt(lambda)) s.t. L L^T = XtX.
     Different matrix than the Cholesky factor, but yields the SAME optimal rank-k W'
     because the truncation objective trace((W-W') XtX (W-W')^T) depends only on XtX.
+
+    ``rcond`` floors the spectrum at ``rcond * lambda_max`` before the square
+    root -- the relative threshold ``pinv`` uses.  It is not optional hygiene on
+    every model: ``collect_xtx_gpu`` accumulates XtX in float32, whose epsilon
+    is 1.19e-7, so with lambda_max = 65 no eigenvalue below roughly 8e-6 is
+    resolved by the data at all.  Dream's post-layernorm MLP input measures
+    lambda_min = 2.0e-17 -- eleven orders of magnitude under that -- which is
+    accumulation noise, and ``clamp(min=0)`` keeps it, so the whitened solve
+    divides by the square root of noise and ||B|| reaches 15000 against
+    ||W|| = 116.  Flooring discards directions the calibration never resolved
+    rather than damping ones it did.
+
+    The floor clamps *up* rather than truncating: the pipeline inverts ``L``, so
+    it must stay square and invertible.  cond(L) is then at most 1/sqrt(rcond).
     """
     raw = XtX.to(solve_dtype)
     ev, V = torch.linalg.eigh(raw)
     ev = ev.clamp(min=0)
+    if rcond > 0:
+        peak = ev.max()
+        if peak > 0:
+            ev = ev.clamp(min=rcond * peak)
     L = V * ev.sqrt().unsqueeze(0)
     return L
 
 
 def whiten_truncate(W, XtX, ratio, decomp="cholesky", solve_dtype=torch.float64,
-                    out_dtype=torch.float32):
+                    out_dtype=torch.float32, rcond=0.0):
     """
     Returns (A, B, k) with A@B the rank-k activation-aware approximation of W.
     Precision ladder matches official: factor/inv in solve_dtype (fp64),
     whitened SVD in out_dtype (fp32).
     """
     out_dim, in_dim = W.shape
+    if decomp == "identity":
+        # Plain weight SVD: the "no activation statistics" control.  Equivalent
+        # to whitening with XtX = I, but skips the factor and the solve.
+        Wf = W.to(out_dtype)
+        U, S, Vt = torch.linalg.svd(Wf, full_matrices=False)
+        k = min(C.rank_from_ratio(ratio, out_dim, in_dim), S.shape[0])
+        sqrt_s = S[:k].sqrt()
+        A = (U[:, :k] * sqrt_s).contiguous()
+        B = (torch.diag(sqrt_s) @ Vt[:k, :]).contiguous()
+        return A, B, k
     if decomp == "cholesky":
         L = cholesky_factor(XtX, solve_dtype)
     elif decomp == "eigh":
-        L = eigh_factor(XtX, solve_dtype)
+        L = eigh_factor(XtX, solve_dtype, rcond=rcond)
     else:
         raise ValueError(decomp)
 
@@ -177,6 +205,22 @@ def collect_xtx_gpu(model, input_ids, target_mods, device, log_prefix="",
     return out
 
 
+def relative_error(W, A, B) -> float:
+    """``||W - A B||_F / ||W||_F`` for one layer.
+
+    Above 1.0 the factorisation is worse than returning zeros, which is not a
+    quality judgement but an arithmetic impossibility for a correct rank-k
+    solution: the optimum is bounded by the identity-whitened one.  It is
+    therefore usable as a hard gate rather than a warning threshold.  Dream's
+    ``clean``/``traj`` arms shipped at 3.7-29.4 and nothing reported it, so the
+    whole table read as "compression destroys Dream" instead of "the solve
+    diverged".
+    """
+    residual = (W - A @ B)
+    denominator = float(W.norm())
+    return float(residual.norm()) / denominator if denominator else float("inf")
+
+
 def plan_bins(targets, budget_bytes):
     """Greedy-bin target linears so each bin's XtX total <= budget (fits on GPU)."""
     bins, cur, cur_b = [], {}, 0
@@ -223,10 +267,14 @@ def fingerprint_weight_dir(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=sorted(C.BACKENDS), required=True)
-    ap.add_argument("--calib", required=True, help="calibration .pt from trajmc-calibrate")
+    ap.add_argument("--calib", default=None,
+                    help="calibration .pt from trajmc-calibrate; "
+                         "not used (and not required) by --decomp identity")
     ap.add_argument("--ratio", type=float, required=True)
-    ap.add_argument("--layer_type", choices=["all", "attn", "mlp"], default="all")
-    ap.add_argument("--decomp", choices=["cholesky", "eigh"], default="cholesky")
+    ap.add_argument("--layer_type", choices=["all", "attn", "mlp", "nokv"], default="all")
+    ap.add_argument("--decomp", choices=["cholesky", "eigh", "identity"],
+                    default="cholesky",
+                    help="identity = plain weight SVD, no calibration activations")
     ap.add_argument("--model_path", type=str, default=None,
                     help="local checkpoint or Hugging Face id")
     ap.add_argument("--save_path", required=True)
@@ -242,6 +290,21 @@ def main():
     ap.add_argument("--offload_model_before_linalg", action="store_true",
                     help="after statistic collection, move the dense model to CPU "
                          "to leave GPU memory for Cholesky/SVD")
+    ap.add_argument("--rcond", type=float, default=0.0,
+                    help="relative eigenvalue floor for --decomp eigh "
+                         "(lambda clamped up to rcond*lambda_max). 0 disables. "
+                         "XtX is accumulated in float32, so eigenvalues below "
+                         "about 1e-7 relative are accumulation noise rather than "
+                         "data; see eigh_factor.")
+    ap.add_argument("--max_relative_error", type=float, default=1.0,
+                    help="refuse to ship any layer whose ||W-AB||_F/||W||_F "
+                         "exceeds this. Above 1.0 the factorisation is worse "
+                         "than zeros, which no correct rank-k solution can be.")
+    ap.add_argument("--save_xtx", default=None,
+                    help="directory to write each layer's XtX into. Collection "
+                         "is the expensive stage and decomposition the cheap "
+                         "one; without this, re-deciding the decomposition "
+                         "means paying for collection again.")
     ap.add_argument("--save_dtype", choices=["float32", "bfloat16"], default="float32",
                     help="factor-file dtype; evaluation casts factors to bfloat16, so "
                          "bfloat16 stores the deployed values without changing runtime math")
@@ -250,6 +313,11 @@ def main():
     args = ap.parse_args()
 
     backend = C.get_backend(args.backend)
+    weight_only = args.decomp == "identity"
+    if weight_only and args.calib:
+        ap.error("--decomp identity ignores activations; drop --calib")
+    if not weight_only and not args.calib:
+        ap.error("--calib is required unless --decomp identity")
     model_path = args.model_path or backend.model_id
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ghash = C.git_hash()
@@ -257,21 +325,29 @@ def main():
     t0 = time.time()
 
     # ── load calib (carries the arm identity) ─────────────────────────────────
-    blob = torch.load(args.calib, map_location="cpu")
-    calib_backend = blob.get("backend")
-    if calib_backend and calib_backend != backend.name:
-        raise ValueError(
-            f"calibration backend={calib_backend!r} does not match "
-            f"--backend={backend.name!r}"
-        )
-    input_ids = blob["input_ids"]
-    if args.nsamples and args.nsamples < input_ids.shape[0]:
-        input_ids = input_ids[: args.nsamples]
-    arm = blob.get("arm", "unknown")
-    print(f"[compress] backend={backend.name} arm={arm} "
-          f"calib={os.path.basename(args.calib)} "
-          f"N={input_ids.shape[0]} ratio={args.ratio} layer_type={args.layer_type} "
-          f"decomp={args.decomp}")
+    if weight_only:
+        blob = {}
+        input_ids = None
+        arm = "weight_svd"
+        print(f"[compress] backend={backend.name} arm={arm} calib=<none> "
+              f"ratio={args.ratio} layer_type={args.layer_type} "
+              f"decomp={args.decomp}")
+    else:
+        blob = torch.load(args.calib, map_location="cpu")
+        calib_backend = blob.get("backend")
+        if calib_backend and calib_backend != backend.name:
+            raise ValueError(
+                f"calibration backend={calib_backend!r} does not match "
+                f"--backend={backend.name!r}"
+            )
+        input_ids = blob["input_ids"]
+        if args.nsamples and args.nsamples < input_ids.shape[0]:
+            input_ids = input_ids[: args.nsamples]
+        arm = blob.get("arm", "unknown")
+        print(f"[compress] backend={backend.name} arm={arm} "
+              f"calib={os.path.basename(args.calib)} "
+              f"N={input_ids.shape[0]} ratio={args.ratio} "
+              f"layer_type={args.layer_type} decomp={args.decomp}")
 
     # ── load model ────────────────────────────────────────────────────────────
     model, _tokenizer = C.load_model(backend, model_path, device=device)
@@ -288,36 +364,53 @@ def main():
     # all-linear XtX (~32GB) exceeds a 46GB GPU beside the 16GB model, so targets
     # are split into bins that each fit; one forward pass per bin.
     targets = list(C.iter_target_linears(model, backend, args.layer_type))
-    t_collect = time.time()
-    budget_gb = args.xtx_budget_gb
-    if budget_gb <= 0:
-        if device == "cuda":
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            budget_gb = max(
-                2.0, free_bytes / 1024 ** 3 - args.xtx_headroom_gb
-            )
-            print(
-                f"[compress] automatic XtX budget: "
-                f"free={free_bytes / 1024**3:.1f}GB "
-                f"total={total_bytes / 1024**3:.1f}GB "
-                f"budget={budget_gb:.1f}GB"
-            )
-        else:
-            budget_gb = 8.0
-    bins = plan_bins(targets, budget_gb * 1024 ** 3)
-    print(f"[compress] {len(targets)} target linears -> {len(bins)} XtX pass(es) "
-          f"(budget {budget_gb:.1f}GB/pass)")
     cov = {}
-    for bi, modules in enumerate(bins):
-        gb = sum(m.in_features ** 2 * 4 for m in modules.values()) / 1024 ** 3
-        print(f"[compress] XtX pass {bi+1}/{len(bins)}: "
-              f"{len(modules)} layers, {gb:.1f}GB", flush=True)
-        cov.update(collect_xtx_gpu(
-            model, input_ids, modules, device, log_prefix=f"p{bi+1} ",
-            batch_size=args.batch_size,
-        ))
-    print(f"[compress] XtX collected for {len(cov)} layers "
-          f"({time.time()-t_collect:.0f}s)")
+    if weight_only:
+        print("[compress] --decomp identity: no activation pass")
+    else:
+        t_collect = time.time()
+        budget_gb = args.xtx_budget_gb
+        if budget_gb <= 0:
+            if device == "cuda":
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                budget_gb = max(
+                    2.0, free_bytes / 1024 ** 3 - args.xtx_headroom_gb
+                )
+                print(
+                    f"[compress] automatic XtX budget: "
+                    f"free={free_bytes / 1024**3:.1f}GB "
+                    f"total={total_bytes / 1024**3:.1f}GB "
+                    f"budget={budget_gb:.1f}GB"
+                )
+            else:
+                budget_gb = 8.0
+        bins = plan_bins(targets, budget_gb * 1024 ** 3)
+        print(f"[compress] {len(targets)} target linears -> {len(bins)} XtX pass(es) "
+              f"(budget {budget_gb:.1f}GB/pass)")
+        for bi, modules in enumerate(bins):
+            gb = sum(m.in_features ** 2 * 4 for m in modules.values()) / 1024 ** 3
+            print(f"[compress] XtX pass {bi+1}/{len(bins)}: "
+                  f"{len(modules)} layers, {gb:.1f}GB", flush=True)
+            cov.update(collect_xtx_gpu(
+                model, input_ids, modules, device, log_prefix=f"p{bi+1} ",
+                batch_size=args.batch_size,
+            ))
+        print(f"[compress] XtX collected for {len(cov)} layers "
+              f"({time.time()-t_collect:.0f}s)")
+        if args.save_xtx:
+            # Collection is the expensive stage and decomposition the cheap one.
+            # Dream's diverged arms had to be re-collected from scratch purely
+            # because the matrices behind them were thrown away, turning a
+            # minutes-long re-solve into an hours-long re-collection.
+            os.makedirs(args.save_xtx, exist_ok=True)
+            for layer_name, matrix in cov.items():
+                torch.save(
+                    matrix.to(torch.float32).cpu(),
+                    os.path.join(args.save_xtx,
+                                 f"{layer_name.replace('.', '_')}_xtx.pt"),
+                )
+            print(f"[compress] XtX saved for {len(cov)} layers -> {args.save_xtx}",
+                  flush=True)
 
     # ── whiten + truncate + replace ───────────────────────────────────────────
     if args.linalg_device == "cuda" and args.offload_model_before_linalg:
@@ -326,27 +419,73 @@ def main():
         print("[compress] dense model offloaded to CPU before CUDA linalg", flush=True)
     t_dec = time.time()
     summary_layers = {}
+    written_files: list[str] = []
+    worst_rel_err = (None, 0.0)
     orig_params = comp_params = n_comp = n_skip = 0
+    n_cpu_fallback = 0
 
     for name, mod in list(C.iter_target_linears(model, backend, args.layer_type)):
-        if name not in cov:
+        if not weight_only and name not in cov:
             continue
         linalg_device = device if args.linalg_device == "cuda" else "cpu"
         W = mod.weight.data.to(device=linalg_device, dtype=torch.float32)
-        stat = cov[name].to(linalg_device)
+        stat = None if weight_only else cov[name].to(linalg_device)
         out_dim, in_dim = W.shape
         k = C.rank_from_ratio(args.ratio, out_dim, in_dim)
         if not C.is_compression_beneficial(k, out_dim, in_dim):
             n_skip += 1
             continue
-        A, B, k = whiten_truncate(W, stat, args.ratio, decomp=args.decomp)
+        # Per-layer OOM fallback.  down_proj's XtX is 18944x18944 and the solve
+        # runs in float64, so eigh peaks near 14 GB on that one layer.  On a
+        # SHARED node the free memory is set by whoever else is on the card, so
+        # choosing a device up front is a guess: an A5000 never fits it and even
+        # a 48 GB L40S may not when a neighbour holds 33 GB.  Rather than fail
+        # the run after 40 minutes of XtX collection, retry just this layer on
+        # the CPU.  Same arithmetic, slower, and only for the layers that
+        # genuinely do not fit.
+        try:
+            A, B, k = whiten_truncate(W, stat, args.ratio, decomp=args.decomp,
+                                      rcond=args.rcond)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"[compress] {name}: solve OOM on {linalg_device}, "
+                  f"retrying this layer on cpu", flush=True)
+            W_c = W.cpu()
+            stat_c = None if stat is None else stat.cpu()
+            del W, stat
+            torch.cuda.empty_cache()
+            A, B, k = whiten_truncate(W_c, stat_c, args.ratio,
+                                      decomp=args.decomp, rcond=args.rcond)
+            W, stat = W_c, stat_c
+            n_cpu_fallback += 1
+
+        # The gate runs before this layer is written, and a failure removes
+        # every factor file *this run* produced.  Files a previous run left
+        # behind are not touched: a diverged solve must not also destroy a
+        # good artifact that happens to share the directory.
+        rel_err = relative_error(W, A, B)
+        if not (rel_err <= args.max_relative_error):
+            for stale in written_files:
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+            raise SystemExit(
+                f"[compress] ABORT: {name} has ||W-AB||_F/||W||_F = {rel_err:.4f} "
+                f"> {args.max_relative_error} (decomp={args.decomp} "
+                f"rcond={args.rcond:g}). A rank-{k} approximation this bad is "
+                f"worse than returning zeros, so the solve diverged rather than "
+                f"the layer being hard. Removed {len(written_files)} factor "
+                f"file(s) written by this run; nothing was shipped."
+            )
 
         prefix = name.replace(".", "_")
         factor_dtype = torch.float32 if args.save_dtype == "float32" else torch.bfloat16
-        torch.save(A.to(dtype=factor_dtype).cpu(),
-                   os.path.join(args.save_path, f"{prefix}_A.pt"))
-        torch.save(B.to(dtype=factor_dtype).cpu(),
-                   os.path.join(args.save_path, f"{prefix}_B.pt"))
+        a_path = os.path.join(args.save_path, f"{prefix}_A.pt")
+        b_path = os.path.join(args.save_path, f"{prefix}_B.pt")
+        torch.save(A.to(dtype=factor_dtype).cpu(), a_path)
+        torch.save(B.to(dtype=factor_dtype).cpu(), b_path)
+        written_files.extend((a_path, b_path))
 
         parent, attr = C.get_parent_attr(model, name)
         # A/B are already saved to disk; the compressed layer is NOT needed on GPU
@@ -358,14 +497,22 @@ def main():
         orig_params += out_dim * in_dim
         comp_params += out_dim * k + k * in_dim
         n_comp += 1
-        summary_layers[name] = {"out": out_dim, "in": in_dim, "k": int(k)}
+        summary_layers[name] = {"out": out_dim, "in": in_dim, "k": int(k),
+                                "relative_error": rel_err}
+        if rel_err > worst_rel_err[1]:
+            worst_rel_err = (name, rel_err)
         # memory hygiene: drop refs, do NOT move 8B params to CPU before del
         del W, stat, A, B
         torch.cuda.empty_cache()
 
     C.assert_head_dense(model)  # lm_head hard guard AFTER replacement
+    if n_cpu_fallback:
+        print(f"[compress] {n_cpu_fallback} layer(s) fell back to cpu for the solve")
     print(f"[compress] compressed={n_comp} skipped={n_skip} "
           f"({time.time()-t_dec:.0f}s)")
+    print(f"[compress] acceptance gate passed: worst layer "
+          f"{worst_rel_err[0]} at ||W-AB||/||W|| = {worst_rel_err[1]:.4f} "
+          f"(limit {args.max_relative_error})")
 
     # ── summary ───────────────────────────────────────────────────────────────
     peak = C.peak_rss_gb()
@@ -375,20 +522,30 @@ def main():
         "calib_scheme": blob.get("scheme", arm),
         "backend": backend.name,
         "model_id": backend.model_id,
-        "calib_file": os.path.basename(args.calib),
+        "calib_file": os.path.basename(args.calib) if args.calib else None,
         "calib_git_hash": blob.get("git_hash"),
-        "calib_sha256": sha256_file(args.calib),
+        "calib_sha256": sha256_file(args.calib) if args.calib else None,
         "calib_objective": blob.get(
-            "objective", "uniform_activation_reconstruction"
+            "objective",
+            "weight_only_svd" if weight_only else "uniform_activation_reconstruction",
         ),
         "calibration_batch_size": args.batch_size,
         "ratio": args.ratio,
+        "rcond": args.rcond,
+        "max_relative_error": args.max_relative_error,
+        "worst_relative_error_layer": worst_rel_err[0],
+        "worst_relative_error": worst_rel_err[1],
+        "acceptance_gate": (
+            "every layer satisfies ||W-AB||_F/||W||_F <= max_relative_error; "
+            "per-layer values are in per_layer[*].relative_error"
+        ),
         "layer_type": args.layer_type,
         "decomp": args.decomp,
         "model_path": model_path,
         "n_target_linears": n_targets,
         "n_compressed": n_comp,
         "n_skipped": n_skip,
+        "n_cpu_fallback_layers": n_cpu_fallback,
         "orig_params": orig_params,
         "compressed_params": comp_params,
         "kept_fraction": (comp_params / orig_params) if orig_params else None,
