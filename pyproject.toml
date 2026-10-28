@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "traj-mc"
 version = "0.1.0"
-description = "Trajectory-matched random-t calibration for masked diffusion language models"
+description = "Trajectory-aware low-rank compression of diffusion language models (Traj-MC)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -19,8 +19,10 @@ dependencies = [
 [project.optional-dependencies]
 eval = [
   "accelerate>=0.34",
-  "lm_eval>=0.4.8",
-  "packaging>=23",
+  "huggingface_hub",
+  "latex2sympy2",
+  "pandas",
+  "sympy",
   "tqdm>=4.66",
 ]
 test = ["pytest>=8"]
@@ -28,10 +30,6 @@ test = ["pytest>=8"]
 [project.scripts]
 trajmc-calibrate = "trajmc.calibration:main"
 trajmc-compress = "trajmc.compression:main"
-trajmc-evaluate = "eval.run:main"
-trajmc-items = "analysis.lmeval_to_items:main"
-trajmc-calib-audit = "analysis.calibration_ablation:main"
-trajmc-covariance = "analysis.covariance_estimation:main"
 
 [tool.setuptools.packages.find]
-include = ["trajmc*", "analysis*", "eval*", "utils*"]
+include = ["trajmc*"]

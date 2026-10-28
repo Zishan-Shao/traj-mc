@@ -1,0 +1,44 @@
+# [trajmc] NOT part of the official Dream Instruct suite.
+#
+# Byte-identical to the vendored minerva_math_algebra.yaml except for the test
+# set: the plan's table reports MATH-500, so this points at
+# HuggingFaceH4/MATH-500 instead of one hendrycks_math subject.  Prompt
+# construction, few-shot block and grading all come from the official
+# lm_eval/tasks/minerva_math/utils.py, unchanged, and the sampler comes from
+# the official eval_instruct/eval.sh row for minerva_math (0-shot,
+# max_new_tokens = diffusion_steps = 512).  MATH-500's rows carry the same
+# `problem` / `solution` fields the official process_docs reads.
+#
+# The fork ships no `minerva_math` group yaml, only the seven per-subject
+# tasks, so `--tasks minerva_math` from the official script does not resolve
+# here; this task is what the MATH column runs against.
+tag:
+  - math_word_problems
+task: minerva_math500
+dataset_path: HuggingFaceH4/MATH-500
+process_docs: !function ../minerva_math/utils.process_docs
+output_type: generate_until
+test_split: test
+doc_to_text:  !function ../minerva_math/utils.doc_to_text
+process_results: !function ../minerva_math/utils.process_results
+doc_to_target: "{{answer if few_shot is undefined else solution}}"
+generation_kwargs:
+  until:
+    - "Problem:"
+  do_sample: false
+  temperature: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 4
+metadata:
+  version: 2.0
+dataset_kwargs:
+  trust_remote_code: true
+fewshot_config:
+  sampler: first_n
+  samples: !function ../minerva_math/utils.list_fewshot_samples
